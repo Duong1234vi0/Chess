@@ -1,5 +1,5 @@
 --[[
-    Chess AI Client v4.6 - PvP/Ranked Sync Fix
+    Chess AI Client v4.7 - Automatic Tactical Safety
     Compact dropdown GUI + Original Game Sunfish + Visual Tracer
 
     Features
@@ -100,6 +100,14 @@ local Config = {
     AutomaticHumanDelay = true,
     AutomaticHesitationChance = 0.20,
     AutomaticCommittee = true,
+
+    -- v4.7 tactical safety.
+    AutomaticNightmareVeto = true,
+    AutomaticSafetyAudit = true,
+    AutomaticSafetyProbeNodes = 42000,
+    AutomaticDeepSafetyNodes = 90000,
+    AutomaticSafetyCandidates = 4,
+    AutomaticDefenseShortlist = 6,
 
     -- Enemy reply search uses a fraction of the selected mode's nodes
     -- so Nightmare does not perform two full 65k-node searches every turn.
@@ -1271,6 +1279,9 @@ local function GetLegalMoveMetrics(match, team)
         captures = 0,
         tactical = 0,
         kingThreat = false,
+        kingZonePressure = 0,
+        kingMobility = 0,
+        forcingPressure = 0,
     }
 
     if type(match) ~= "table"
@@ -1295,9 +1306,12 @@ local function GetLegalMoveMetrics(match, team)
             if type(piece) == "table"
                 and type(piece.position) == "table" then
 
-                if PieceLetterFromObject(
-                    piece.object
-                ) == "K" then
+                local letter =
+                    PieceLetterFromObject(
+                        piece.object
+                    )
+
+                if letter == "K" then
                     kingPosition =
                         piece.position
                 end
@@ -1314,6 +1328,10 @@ local function GetLegalMoveMetrics(match, team)
                         if type(move) == "table" then
                             metrics.legal += 1
 
+                            if letter == "K" then
+                                metrics.kingMobility += 1
+                            end
+
                             local isTactical =
                                 move.promote ~= nil
                                 or move.castle ~= nil
@@ -1321,6 +1339,7 @@ local function GetLegalMoveMetrics(match, team)
                                 or move.capture ~= nil
 
                             local target
+
                             pcall(function()
                                 target =
                                     match:getPiece({
@@ -1346,16 +1365,10 @@ local function GetLegalMoveMetrics(match, team)
         end
     end
 
-    -- Observable "king pressure": does any currently generated enemy
-    -- move land on our king square? This is telemetry, not hidden reasoning.
     if kingPosition
         and type(enemyPieces) == "table" then
 
         for _, piece in pairs(enemyPieces) do
-            if metrics.kingThreat then
-                break
-            end
-
             if type(piece) == "table"
                 and type(piece.position) == "table" then
 
@@ -1368,12 +1381,51 @@ local function GetLegalMoveMetrics(match, team)
                     and type(moves) == "table" then
 
                     for _, move in pairs(moves) do
-                        if type(move) == "table"
-                            and move[1] == kingPosition[1]
-                            and move[2] == kingPosition[2] then
+                        if type(move) == "table" then
+                            local dx =
+                                math.abs(
+                                    move[1]
+                                    - kingPosition[1]
+                                )
 
-                            metrics.kingThreat = true
-                            break
+                            local dy =
+                                math.abs(
+                                    move[2]
+                                    - kingPosition[2]
+                                )
+
+                            if move[1] == kingPosition[1]
+                                and move[2] == kingPosition[2] then
+
+                                metrics.kingThreat = true
+                                metrics.forcingPressure += 3
+
+                            elseif dx <= 1
+                                and dy <= 1 then
+
+                                metrics.kingZonePressure += 1
+                                metrics.forcingPressure += 1
+                            end
+
+                            if dx <= 2
+                                and dy <= 2 then
+
+                                local target
+
+                                pcall(function()
+                                    target =
+                                        match:getPiece({
+                                            move[1],
+                                            move[2],
+                                        })
+                                end)
+
+                                if type(target) == "table"
+                                    and target.team == team then
+
+                                    metrics.forcingPressure += 1
+                                end
+                            end
                         end
                     end
                 end
@@ -1460,6 +1512,595 @@ local function RunSearchProfile(
         candidateGap =
             CandidateGap(results),
     }
+end
+
+
+--// ============================================================
+--// AUTOMATIC v4.7: TACTICAL / MATE SAFETY AUDIT
+--// ============================================================
+
+local function FinalSearchScore(results)
+    if type(results) ~= "table"
+        or #results == 0 then
+        return nil
+    end
+
+    local final = results[#results]
+
+    if type(final) ~= "table" then
+        return nil
+    end
+
+    return tonumber(final.score1)
+end
+
+local function BuildSafetySettings(deep)
+    local settings =
+        DeepCopy(
+            Profiles.Nightmare
+            or Profiles.Hard
+        )
+
+    settings.worseMoveChance = 0
+
+    if deep then
+        settings.nodes =
+            math.max(
+                tonumber(settings.nodes) or 0,
+                Config.AutomaticDeepSafetyNodes
+            )
+
+        settings.depth =
+            math.max(
+                tonumber(settings.depth) or 0,
+                12
+            )
+    else
+        settings.nodes =
+            math.max(
+                20000,
+                math.min(
+                    tonumber(settings.nodes)
+                    or Config.AutomaticSafetyProbeNodes,
+                    Config.AutomaticSafetyProbeNodes
+                )
+            )
+
+        settings.depth =
+            math.max(
+                6,
+                math.min(
+                    tonumber(settings.depth) or 6,
+                    10
+                )
+            )
+    end
+
+    return settings
+end
+
+local function ProbeOpponentAfterMove(
+    position,
+    ourMove,
+    deep
+)
+    if type(position) ~= "table"
+        or type(ourMove) ~= "table" then
+
+        return nil, "INVALID SAFETY INPUT"
+    end
+
+    local okNext, nextPosition =
+        pcall(function()
+            return position:move(
+                ourMove
+            )
+        end)
+
+    if not okNext
+        or type(nextPosition) ~= "table" then
+
+        return nil,
+            "SAFETY POSITION FAILED"
+    end
+
+    local settings =
+        BuildSafetySettings(deep)
+
+    local okSearch,
+        results,
+        mateState =
+        pcall(
+            Sunfish.search,
+            nextPosition,
+            settings.nodes,
+            settings.depth,
+            settings
+        )
+
+    if not okSearch then
+        return nil,
+            "SAFETY SEARCH ERROR: "
+            .. tostring(results)
+    end
+
+    if type(results) ~= "table"
+        or #results == 0 then
+
+        return nil,
+            "SAFETY NO RESULT"
+    end
+
+    local okChoose,
+        enemyMove,
+        enemyScore =
+        pcall(
+            Sunfish.chooseMove,
+            results,
+            settings
+        )
+
+    if not okChoose then
+        enemyMove = nil
+        enemyScore =
+            FinalSearchScore(results)
+    end
+
+    enemyScore =
+        tonumber(enemyScore)
+        or FinalSearchScore(results)
+        or 0
+
+    local mateDanger =
+        (
+            type(mateState) == "number"
+            and mateState > 0
+        )
+        or enemyScore >= 29000
+
+    local severeDanger =
+        mateDanger
+        or enemyScore >= 1200
+
+    return {
+        nextPosition = nextPosition,
+        enemyMove = enemyMove,
+        enemyScore = enemyScore,
+        mateState = mateState,
+        mateDanger = mateDanger,
+        severeDanger = severeDanger,
+        candidateGap =
+            CandidateGap(results),
+        settings = settings,
+        results = results,
+    }
+end
+
+local function AddUniqueSafetyCandidate(
+    list,
+    seen,
+    move,
+    ownScore,
+    source
+)
+    if type(move) ~= "table" then
+        return
+    end
+
+    local key =
+        MoveIdentity(move)
+
+    if seen[key] then
+        return
+    end
+
+    seen[key] = true
+
+    list[#list + 1] = {
+        move = move,
+        ownScore = tonumber(ownScore),
+        source = source,
+    }
+end
+
+local function PrincipalSafetyCandidates(
+    primaryMove,
+    primaryInfo,
+    nightmareMove,
+    nightmareInfo
+)
+    local list = {}
+    local seen = {}
+
+    AddUniqueSafetyCandidate(
+        list,
+        seen,
+        primaryMove,
+        primaryInfo
+            and primaryInfo.score,
+        "selected"
+    )
+
+    AddUniqueSafetyCandidate(
+        list,
+        seen,
+        nightmareMove,
+        nightmareInfo
+            and nightmareInfo.score,
+        "nightmare"
+    )
+
+    local sourceInfo =
+        nightmareInfo
+        or primaryInfo
+
+    if sourceInfo
+        and type(sourceInfo.candidates)
+            == "table" then
+
+        for _, candidate in ipairs(
+            sourceInfo.candidates
+        ) do
+            AddUniqueSafetyCandidate(
+                list,
+                seen,
+                candidate.move,
+                candidate.score,
+                "candidate"
+            )
+
+            if #list
+                >= Config.AutomaticSafetyCandidates then
+                break
+            end
+        end
+    end
+
+    return list
+end
+
+local function ShortlistGameLegalDefenses(
+    match,
+    position,
+    team
+)
+    local pieces =
+        team
+        and match.whitePieces
+        or match.blackPieces
+
+    if type(pieces) ~= "table" then
+        return {}
+    end
+
+    local moves = {}
+    local seen = {}
+
+    for _, piece in pairs(pieces) do
+        if type(piece) == "table"
+            and piece.team == team
+            and type(piece.position) == "table" then
+
+            local okMoves, gameMoves =
+                pcall(function()
+                    return piece:getMoves()
+                end)
+
+            if okMoves
+                and type(gameMoves) == "table" then
+
+                for _, gameMove in pairs(gameMoves) do
+                    if type(gameMove) == "table" then
+                        local sunfishMove =
+                            MatchMoveToSunfish(
+                                position,
+                                piece.position,
+                                gameMove
+                            )
+
+                        if sunfishMove then
+                            local key =
+                                MoveIdentity(
+                                    sunfishMove
+                                )
+
+                            if not seen[key] then
+                                seen[key] = true
+
+                                local okEval,
+                                    eval =
+                                    pcall(
+                                        Sunfish.evaluateMove,
+                                        position,
+                                        sunfishMove
+                                    )
+
+                                moves[#moves + 1] = {
+                                    move = sunfishMove,
+                                    ownScore =
+                                        okEval
+                                        and tonumber(eval)
+                                        or -90000,
+                                    source = "legal-defense",
+                                }
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    table.sort(
+        moves,
+        function(a, b)
+            return (
+                tonumber(a.ownScore)
+                or -90000
+            ) > (
+                tonumber(b.ownScore)
+                or -90000
+            )
+        end
+    )
+
+    local shortlist = {}
+
+    for i = 1,
+        math.min(
+            #moves,
+            Config.AutomaticDefenseShortlist
+        ) do
+
+        shortlist[#shortlist + 1] =
+            moves[i]
+    end
+
+    return shortlist
+end
+
+local function ChooseSafestAuditedCandidate(
+    audits
+)
+    if type(audits) ~= "table"
+        or #audits == 0 then
+        return nil
+    end
+
+    table.sort(
+        audits,
+        function(a, b)
+            if a.audit.mateDanger
+                ~= b.audit.mateDanger then
+
+                return not a.audit.mateDanger
+            end
+
+            if a.audit.enemyScore
+                ~= b.audit.enemyScore then
+
+                return a.audit.enemyScore
+                    < b.audit.enemyScore
+            end
+
+            return (
+                tonumber(a.entry.ownScore)
+                or -90000
+            ) > (
+                tonumber(b.entry.ownScore)
+                or -90000
+            )
+        end
+    )
+
+    return audits[1]
+end
+
+local function SafetyAuditAutomaticMove(
+    match,
+    position,
+    team,
+    primaryMove,
+    primaryInfo,
+    nightmareMove,
+    nightmareInfo,
+    forceDeep
+)
+    if not Config.AutomaticSafetyAudit then
+        return primaryMove,
+            primaryInfo,
+            {
+                audited = false,
+            }
+    end
+
+    SetThinkingNarrative(
+        forceDeep
+            and "Mate Safety sâu: đang mô phỏng nước đã chọn và cho đối thủ phản công..."
+            or "Safety Probe: đang kiểm tra nước này có mở đòn phản công cưỡng bức không...",
+        "thinking"
+    )
+
+    local firstAudit,
+        firstError =
+        ProbeOpponentAfterMove(
+            position,
+            primaryMove,
+            forceDeep
+        )
+
+    if not firstAudit then
+        return primaryMove,
+            primaryInfo,
+            {
+                audited = false,
+                error = firstError,
+            }
+    end
+
+    if not forceDeep
+        and not firstAudit.mateDanger
+        and not firstAudit.severeDanger then
+
+        return primaryMove,
+            primaryInfo,
+            {
+                audited = true,
+                changed = false,
+                audit = firstAudit,
+            }
+    end
+
+    local candidates =
+        PrincipalSafetyCandidates(
+            primaryMove,
+            primaryInfo,
+            nightmareMove,
+            nightmareInfo
+        )
+
+    local audited = {}
+
+    for index, entry in ipairs(candidates) do
+        SetThinkingNarrative(
+            string.format(
+                "Mate Safety %d/%d: kiểm tra phản đòn của đối thủ...",
+                index,
+                #candidates
+            ),
+            "thinking"
+        )
+
+        local audit
+
+        if forceDeep
+            and MoveIdentity(entry.move)
+                == MoveIdentity(primaryMove) then
+
+            audit = firstAudit
+        else
+            audit =
+                ProbeOpponentAfterMove(
+                    position,
+                    entry.move,
+                    true
+                )
+        end
+
+        if type(audit) == "table" then
+            audited[#audited + 1] = {
+                entry = entry,
+                audit = audit,
+            }
+        end
+    end
+
+    local safest =
+        ChooseSafestAuditedCandidate(
+            audited
+        )
+
+    if safest
+        and safest.audit.mateDanger then
+
+        SetThinkingNarrative(
+            "Candidate chính đều có nguy cơ mate. Quét legal moves để tìm phòng thủ.",
+            "warning"
+        )
+
+        local defenses =
+            ShortlistGameLegalDefenses(
+                match,
+                position,
+                team
+            )
+
+        for index, entry in ipairs(defenses) do
+            SetThinkingNarrative(
+                string.format(
+                    "Defense audit %d/%d: thử nước phòng thủ hợp lệ...",
+                    index,
+                    #defenses
+                ),
+                "thinking"
+            )
+
+            local audit =
+                ProbeOpponentAfterMove(
+                    position,
+                    entry.move,
+                    true
+                )
+
+            if type(audit) == "table" then
+                audited[#audited + 1] = {
+                    entry = entry,
+                    audit = audit,
+                }
+            end
+        end
+
+        safest =
+            ChooseSafestAuditedCandidate(
+                audited
+            )
+    end
+
+    if not safest then
+        return primaryMove,
+            primaryInfo,
+            {
+                audited = true,
+                changed = false,
+                audit = firstAudit,
+            }
+    end
+
+    local changed =
+        MoveIdentity(
+            safest.entry.move
+        ) ~= MoveIdentity(
+            primaryMove
+        )
+
+    local selectedInfo =
+        primaryInfo
+
+    if nightmareMove
+        and nightmareInfo
+        and MoveIdentity(
+            safest.entry.move
+        ) == MoveIdentity(
+            nightmareMove
+        ) then
+
+        selectedInfo =
+            nightmareInfo
+    end
+
+    if changed then
+        SetThinkingNarrative(
+            safest.audit.mateDanger
+                and "Không có candidate thoát hoàn toàn; chọn nước phòng thủ kéo dài tốt nhất."
+                or string.format(
+                    "Safety VETO: bác nước ban đầu. Eval phản công đối thủ còn %+0.2f.",
+                    safest.audit.enemyScore / 100
+                ),
+            safest.audit.mateDanger
+                and "warning"
+                or "decision"
+        )
+    end
+
+    return safest.entry.move,
+        selectedInfo,
+        {
+            audited = true,
+            changed = changed,
+            audit = safest.audit,
+            originalAudit = firstAudit,
+            source = safest.entry.source,
+        }
 end
 
 local function ChooseCommitteeResult(entries)
@@ -1563,11 +2204,13 @@ local function AutomaticSearch(
 
     SetThinkingNarrative(
         string.format(
-            "Đang đọc thế cờ: %d nước hợp lệ, %d nước bắt quân%s.",
+            "Đọc thế: %d legal • %d capture • King mobility %d • pressure %d%s.",
             metrics.legal,
             metrics.captures,
+            metrics.kingMobility,
+            metrics.kingZonePressure,
             metrics.kingThreat
-                and " • Vua đang chịu áp lực"
+                and " • CHECK"
                 or ""
         ),
         "thinking"
@@ -1575,10 +2218,8 @@ local function AutomaticSearch(
 
     task.wait()
 
-    -- Easy is the scout. If the answer is obvious, there is no reason
-    -- to spend Nightmare-level nodes.
     SetThinkingNarrative(
-        "Easy đang quét nhanh để xem thế này có câu trả lời rõ ràng không...",
+        "Easy scout đang đo độ rõ của position...",
         "thinking"
     )
 
@@ -1593,12 +2234,37 @@ local function AutomaticSearch(
     end
 
     local gap =
-        easyInfo.candidateGap or 99999
+        easyInfo.candidateGap
+        or 99999
 
     local complexity = 0
 
     if metrics.kingThreat then
-        complexity += 4
+        complexity += 5
+    end
+
+    if metrics.kingZonePressure >= 6 then
+        complexity += 3
+    elseif metrics.kingZonePressure >= 3 then
+        complexity += 2
+    elseif metrics.kingZonePressure >= 1 then
+        complexity += 1
+    end
+
+    if metrics.kingMobility <= 1 then
+        complexity += 3
+    elseif metrics.kingMobility <= 2 then
+        complexity += 2
+    elseif metrics.kingMobility <= 3 then
+        complexity += 1
+    end
+
+    if metrics.forcingPressure >= 8 then
+        complexity += 3
+    elseif metrics.forcingPressure >= 4 then
+        complexity += 2
+    elseif metrics.forcingPressure >= 1 then
+        complexity += 1
     end
 
     if metrics.legal >= 24 then
@@ -1607,7 +2273,7 @@ local function AutomaticSearch(
         complexity += 1
     end
 
-    if metrics.tactical >= 4 then
+    if metrics.tactical >= 5 then
         complexity += 2
     elseif metrics.tactical >= 1 then
         complexity += 1
@@ -1622,15 +2288,16 @@ local function AutomaticSearch(
     end
 
     local easyScore =
-        tonumber(easyInfo.score) or 0
+        tonumber(easyInfo.score)
+        or 0
 
     if math.abs(easyScore) < 90 then
         complexity += 1
     end
 
-    -- Very forced positions with one clearly superior move are easier,
-    -- unless the king is actually under pressure.
     if not metrics.kingThreat
+        and metrics.kingZonePressure == 0
+        and metrics.forcingPressure == 0
         and gap > 300
         and metrics.legal <= 12 then
 
@@ -1648,26 +2315,39 @@ local function AutomaticSearch(
             9
         )
 
+    local critical =
+        metrics.kingThreat
+        or metrics.kingZonePressure >= 3
+        or metrics.kingMobility <= 2
+        or metrics.forcingPressure >= 5
+        or complexity >= 7
+
     local chosenMove = easyMove
     local chosenInfo = easyInfo
+
+    local hardMove
+    local hardInfo
+    local nightmareMove
+    local nightmareInfo
+
     local committeeText = "Easy"
 
     if complexity <= 2
-        and not metrics.kingThreat then
+        and not critical then
 
         SetThinkingNarrative(
             string.format(
-                "Thế khá rõ (gap %.0f). Easy đã đủ chắc, không cần nghĩ sâu hơn.",
+                "Position rõ (gap %.0f). Giữ scout và chạy Safety Probe.",
                 gap
             ),
-            "decision"
+            "thinking"
         )
 
     elseif complexity <= 4
-        and not metrics.kingThreat then
+        and not critical then
 
         SetThinkingNarrative(
-            "Easy thấy vài phương án gần nhau. Normal vào kiểm tra lại.",
+            "Normal đang xác nhận lại scout.",
             "thinking"
         )
 
@@ -1685,22 +2365,22 @@ local function AutomaticSearch(
         end
 
     elseif complexity <= 6
-        and not metrics.kingThreat then
+        and not critical then
 
         SetThinkingNarrative(
-            "Thế có yếu tố chiến thuật. Chuyển Hard để kiểm tra sâu hơn.",
+            "Thế có chiến thuật. Hard đang kiểm tra principal variation.",
             "thinking"
         )
 
-        local move, info =
+        hardMove, hardInfo =
             RunSearchProfile(
                 position,
                 "Hard"
             )
 
-        if move then
-            chosenMove = move
-            chosenInfo = info
+        if hardMove then
+            chosenMove = hardMove
+            chosenInfo = hardInfo
             committeeText =
                 "Easy → Hard"
         end
@@ -1708,23 +2388,23 @@ local function AutomaticSearch(
     else
         SetThinkingNarrative(
             metrics.kingThreat
-                and "Vua đang bị ép. Hard và Nightmare đang kiểm tra độc lập rồi bỏ phiếu."
-                or "Các ứng viên quá sát. Hard và Nightmare đang kiểm tra độc lập rồi bỏ phiếu.",
+                and "CHECK / King danger: bỏ majority vote. Hard + Nightmare đang tìm phòng thủ."
+                or "Critical position: Nightmare có quyền veto các profile nông.",
             "thinking"
         )
 
-        local hardMove, hardInfo =
+        hardMove, hardInfo =
             RunSearchProfile(
                 position,
                 "Hard"
             )
 
         SetThinkingNarrative(
-            "Nightmare đang làm lượt kiểm tra cuối...",
+            "Nightmare đang search sâu và giữ quyền veto...",
             "thinking"
         )
 
-        local nightmareMove,
+        nightmareMove,
             nightmareInfo =
             RunSearchProfile(
                 position,
@@ -1749,38 +2429,83 @@ local function AutomaticSearch(
             },
         }
 
-        if Config.AutomaticCommittee then
-            local consensus,
-                votes =
-                ChooseCommitteeResult(
-                    entries
-                )
+        local consensus,
+            votes =
+            ChooseCommitteeResult(
+                entries
+            )
 
-            if consensus then
-                chosenMove =
+        committeeText =
+            string.format(
+                "committee %d/3",
+                votes or 1
+            )
+
+        if Config.AutomaticNightmareVeto
+            and nightmareMove then
+
+            chosenMove = nightmareMove
+            chosenInfo = nightmareInfo
+
+            if consensus
+                and MoveIdentity(
                     consensus.move
-
-                chosenInfo =
-                    consensus.info
+                ) == MoveIdentity(
+                    nightmareMove
+                ) then
 
                 committeeText =
-                    string.format(
-                        "Easy/Hard/Nightmare • %d/3 đồng ý",
-                        votes or 1
-                    )
+                    committeeText
+                    .. " • Nightmare confirmed"
+            else
+                committeeText =
+                    committeeText
+                    .. " • Nightmare VETO"
             end
+
+        elseif consensus then
+            chosenMove = consensus.move
+            chosenInfo = consensus.info
+
         elseif nightmareMove then
             chosenMove = nightmareMove
             chosenInfo = nightmareInfo
-            committeeText =
-                "Nightmare"
+            committeeText = "Nightmare"
+        end
+    end
+
+    local shouldAudit =
+        critical
+        or complexity >= 4
+        or metrics.tactical >= 2
+        or metrics.kingZonePressure > 0
+
+    local safety
+
+    if shouldAudit then
+        local auditedMove,
+            auditedInfo,
+            auditInfo =
+            SafetyAuditAutomaticMove(
+                match,
+                position,
+                localTeam,
+                chosenMove,
+                chosenInfo,
+                nightmareMove,
+                nightmareInfo,
+                critical
+            )
+
+        if auditedMove then
+            chosenMove = auditedMove
         end
 
-        if nightmareMove
-            and not chosenMove then
-            chosenMove = nightmareMove
-            chosenInfo = nightmareInfo
+        if auditedInfo then
+            chosenInfo = auditedInfo
         end
+
+        safety = auditInfo
     end
 
     chosenInfo.automatic = {
@@ -1789,20 +2514,62 @@ local function AutomaticSearch(
         captures = metrics.captures,
         tactical = metrics.tactical,
         kingThreat = metrics.kingThreat,
+        kingZonePressure =
+            metrics.kingZonePressure,
+        kingMobility =
+            metrics.kingMobility,
+        forcingPressure =
+            metrics.forcingPressure,
         scoutGap = gap,
         committee = committeeText,
+        safetyAudited =
+            safety
+            and safety.audited
+            or false,
+        safetyChanged =
+            safety
+            and safety.changed
+            or false,
+        opponentAuditScore =
+            safety
+            and safety.audit
+            and safety.audit.enemyScore
+            or nil,
+        opponentMateDanger =
+            safety
+            and safety.audit
+            and safety.audit.mateDanger
+            or false,
     }
+
+    local safetyText = ""
+
+    if chosenInfo.automatic.safetyAudited then
+        if chosenInfo.automatic.opponentMateDanger then
+            safetyText =
+                " • mate danger"
+        elseif chosenInfo.automatic.safetyChanged then
+            safetyText =
+                " • Safety VETO đổi nước"
+        else
+            safetyText =
+                " • Safety OK"
+        end
+    end
 
     SetThinkingNarrative(
         string.format(
-            "Chốt %s • độ khó %d/9 • %s.",
+            "Chốt %s • độ khó %d/9 • %s%s.",
             tostring(
                 chosenInfo.selectedMode
             ),
             complexity,
-            committeeText
+            committeeText,
+            safetyText
         ),
-        "decision"
+        chosenInfo.automatic.opponentMateDanger
+            and "warning"
+            or "decision"
     )
 
     return chosenMove,
@@ -1927,6 +2694,22 @@ local function AutomaticMoveDelay(
                 RandomRange(
                     0.25,
                     0.90
+                )
+        end
+
+        if automatic.safetyChanged then
+            delay +=
+                RandomRange(
+                    0.35,
+                    1.15
+                )
+        end
+
+        if automatic.opponentMateDanger then
+            delay +=
+                RandomRange(
+                    0.50,
+                    1.30
                 )
         end
     end
