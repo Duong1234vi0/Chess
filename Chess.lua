@@ -1,5 +1,5 @@
 --[[
-    Chess AI Client v4.5 - Compact Draggable Viewport HUD
+    Chess AI Client v4.6 - PvP/Ranked Sync Fix
     Compact dropdown GUI + Original Game Sunfish + Visual Tracer
 
     Features
@@ -59,6 +59,22 @@ local SunfishHandlerModule = Modules:WaitForChild("SunfishHandler")
 local SunfishModule = SunfishHandlerModule:WaitForChild("Sunfish")
 
 local Sunfish = require(SunfishModule)
+
+-- Ranked/PvP FIX:
+-- The game's setupBot() normally initializes this callback, but
+-- player-vs-player matches do not run setupBot at all.
+--
+-- Sunfish search calls the callback unconditionally for every
+-- recursive node, so leaving it nil causes SEARCH ERROR in PvP/Ranked.
+if type(Sunfish.setFrameKeepingFunction) == "function" then
+    Sunfish.setFrameKeepingFunction(
+        function(nodeCount)
+            if nodeCount % 500 == 0 then
+                task.wait()
+            end
+        end
+    )
+end
 
 --// ============================================================
 --// CONFIG
@@ -969,6 +985,79 @@ local function GetEnginePosition(match)
     return nil, Shadow.reason
 end
 
+local function AdvanceShadowAfterOwnMove(
+    match,
+    sunfishMove,
+    fromPos,
+    toMove,
+    expectedPosition
+)
+    if type(match) ~= "table"
+        or match.mode == "sunfish" then
+
+        return true
+    end
+
+    if Shadow.matchId ~= match.id then
+        ResetShadow(match)
+    end
+
+    if not Shadow.ready
+        or type(Shadow.position) ~= "table" then
+
+        return false,
+            Shadow.reason
+            or "SHADOW NOT READY"
+    end
+
+    -- The move was searched from this exact shadow position.
+    -- If something else advanced it in the meantime, do not double-apply.
+    if expectedPosition
+        and Shadow.position ~= expectedPosition then
+
+        return false,
+            "SHADOW CHANGED BEFORE LOCAL COMMIT"
+    end
+
+    local ok, nextPosition =
+        pcall(function()
+            return Shadow.position:move(
+                sunfishMove
+            )
+        end)
+
+    if not ok
+        or type(nextPosition) ~= "table" then
+
+        Shadow.ready = false
+        Shadow.reason =
+            "DESYNC: LOCAL SHADOW UPDATE FAILED"
+
+        return false,
+            Shadow.reason
+    end
+
+    Shadow.position =
+        nextPosition
+
+    -- Some servers may echo the sender's move, some may not.
+    -- If an echo arrives, ApplyConfirmedMoveToShadow() will ignore
+    -- this exact move once rather than advancing the position twice.
+    Shadow.pendingKey =
+        MoveKey(
+            fromPos,
+            toMove
+        )
+
+    Shadow.pendingUntil =
+        os.clock() + 3.0
+
+    Shadow.reason =
+        "SYNCED AFTER LOCAL MOVE"
+
+    return true
+end
+
 local function ExtractMoveFromArgs(...)
     local args = table.pack(...)
     local positions = {}
@@ -1028,7 +1117,7 @@ local function ApplyConfirmedMoveToShadow(fromPos, toMove)
     if not move then
         Shadow.ready = false
         Shadow.reason =
-            "DESYNC: MOVE CONVERSION FAILED"
+            "DESYNC: MOVE CONVERSION FAILED (REMOTE MOVE)"
 
         return
     end
@@ -4376,9 +4465,17 @@ local function Analyze(
     if not ok then
         Thinking = false
 
-        SetStatus(
+        local crashText =
             "SEARCH CRASH: "
-            .. tostring(bestMove),
+            .. tostring(bestMove)
+
+        SetThinkingNarrative(
+            crashText,
+            "warning"
+        )
+
+        SetStatus(
+            crashText,
             true
         )
 
@@ -4388,10 +4485,18 @@ local function Analyze(
     if not bestMove then
         Thinking = false
 
-        SetStatus(
+        local searchError =
             info
-                and info.error
-                or "NO MOVE",
+            and info.error
+            or "NO MOVE"
+
+        SetThinkingNarrative(
+            tostring(searchError),
+            "warning"
+        )
+
+        SetStatus(
+            searchError,
             true
         )
 
@@ -4687,6 +4792,39 @@ local function Analyze(
 
         Thinking = false
         return false
+    end
+
+    -- PvP FIX:
+    -- MovePiece.OnClientEvent does not reliably echo our own move.
+    -- Without this local commit the shadow position stays one ply
+    -- behind; the opponent's next move then fails conversion.
+    if liveMatch.mode ~= "sunfish" then
+        local shadowOK,
+            shadowError =
+            AdvanceShadowAfterOwnMove(
+                liveMatch,
+                actualMove,
+                liveResolved.from,
+                liveResolved.move,
+                info.position
+            )
+
+        if not shadowOK then
+            SetThinkingNarrative(
+                "Nước đã được game gửi, nhưng Shadow không commit được: "
+                .. tostring(shadowError)
+                .. ". Tạm dừng AutoMove để tránh lệch bàn.",
+                "warning"
+            )
+
+            SetStatus(
+                "SHADOW COMMIT FAILED",
+                true
+            )
+
+            Thinking = false
+            return false
+        end
     end
 
     SetStatus(
