@@ -1,5 +1,5 @@
 --[[
-    Chess AI Client v4.4 - Separate HUD Overlay
+    Chess AI Client v4.5 - Compact Draggable Viewport HUD
     Compact dropdown GUI + Original Game Sunfish + Visual Tracer
 
     Features
@@ -315,8 +315,17 @@ end
 local function CountTeamPieces(match, team)
     local counts = EmptyPieceCounts()
 
+    local samples = {
+        P = nil,
+        N = nil,
+        B = nil,
+        R = nil,
+        Q = nil,
+        K = nil,
+    }
+
     if type(match) ~= "table" then
-        return counts
+        return counts, samples
     end
 
     local list =
@@ -338,18 +347,25 @@ local function CountTeamPieces(match, team)
                 if counts[letter] ~= nil then
                     counts[letter] += 1
                     counts.total += 1
+
+                    if samples[letter] == nil
+                        and typeof(piece.object) == "Instance" then
+
+                        samples[letter] =
+                            piece.object
+                    end
                 end
             end
         end
 
-        return counts
+        return counts, samples
     end
 
-    -- Fallback to currentMatch.contents.
+    -- Fallback: scan currentMatch.contents.
     local source = match.contents
 
     if type(source) ~= "table" then
-        return counts
+        return counts, samples
     end
 
     if type(source[1]) == "table"
@@ -377,13 +393,20 @@ local function CountTeamPieces(match, team)
                     if counts[letter] ~= nil then
                         counts[letter] += 1
                         counts.total += 1
+
+                        if samples[letter] == nil
+                            and typeof(piece.object) == "Instance" then
+
+                            samples[letter] =
+                                piece.object
+                        end
                     end
                 end
             end
         end
     end
 
-    return counts
+    return counts, samples
 end
 
 local function MaterialScore(counts)
@@ -400,18 +423,18 @@ local function FormatPieceCounts(counts, whiteSide)
     local icons =
         whiteSide
         and {
-            Q = "♕",
-            R = "♖",
-            B = "♗",
-            N = "♘",
-            P = "♙",
+            Q = "",
+            R = "",
+            B = "",
+            N = "",
+            P = "",
         }
         or {
-            Q = "♛",
-            R = "♜",
-            B = "♝",
-            N = "♞",
-            P = "♟",
+            Q = "",
+            R = "",
+            B = "",
+            N = "",
+            P = "",
         }
 
     return string.format(
@@ -2727,21 +2750,30 @@ HUDRoot.Active = false
 HUDRoot.ZIndex = 5
 HUDRoot.Parent = ScreenGui
 
-local function NewHUDFrame(name, size, position, anchorPoint)
+local function NewHUDFrame(
+    name,
+    size,
+    position,
+    anchorPoint
+)
     local frame =
         Instance.new("Frame")
 
     frame.Name = name
     frame.Size = size
     frame.Position = position
+
     frame.AnchorPoint =
         anchorPoint or Vector2.new(0, 0)
 
     frame.BackgroundColor3 =
         Color3.fromRGB(17, 19, 24)
 
-    frame.BackgroundTransparency = 0.14
+    frame.BackgroundTransparency = 0.12
     frame.BorderSizePixel = 0
+
+    -- Needed for touch/mouse dragging.
+    frame.Active = true
     frame.ZIndex = 6
     frame.Parent = HUDRoot
 
@@ -2749,7 +2781,7 @@ local function NewHUDFrame(name, size, position, anchorPoint)
         "UICorner",
         frame
     ).CornerRadius =
-        UDim.new(0, 9)
+        UDim.new(0, 8)
 
     local stroke =
         Instance.new("UIStroke")
@@ -2757,132 +2789,504 @@ local function NewHUDFrame(name, size, position, anchorPoint)
     stroke.Color =
         Color3.fromRGB(54, 58, 69)
 
-    stroke.Transparency = 0.28
+    stroke.Transparency = 0.35
     stroke.Thickness = 1
     stroke.Parent = frame
 
     return frame
 end
 
--- YOU / left ---------------------------------------------------
+-- Generic touch + mouse dragging for every HUD element.
+local function MakeHUDDraggable(frame)
+    local dragging = false
+    local dragInput
+    local dragStart
+    local startPosition
 
-local YouHUD =
+    local function update(input)
+        if not dragging
+            or not dragStart
+            or not startPosition then
+
+            return
+        end
+
+        local delta =
+            input.Position - dragStart
+
+        frame.Position =
+            UDim2.new(
+                startPosition.X.Scale,
+                startPosition.X.Offset + delta.X,
+                startPosition.Y.Scale,
+                startPosition.Y.Offset + delta.Y
+            )
+    end
+
+    frame.InputBegan:Connect(
+        function(input)
+            if input.UserInputType
+                    == Enum.UserInputType.MouseButton1
+                or input.UserInputType
+                    == Enum.UserInputType.Touch then
+
+                dragging = true
+                dragStart = input.Position
+                startPosition = frame.Position
+
+                input.Changed:Connect(
+                    function()
+                        if input.UserInputState
+                            == Enum.UserInputState.End then
+
+                            dragging = false
+                        end
+                    end
+                )
+            end
+        end
+    )
+
+    frame.InputChanged:Connect(
+        function(input)
+            if input.UserInputType
+                    == Enum.UserInputType.MouseMovement
+                or input.UserInputType
+                    == Enum.UserInputType.Touch then
+
+                dragInput = input
+            end
+        end
+    )
+
+    UserInputService.InputChanged:Connect(
+        function(input)
+            if dragging
+                and (
+                    input == dragInput
+                    or input.UserInputType
+                        == Enum.UserInputType.Touch
+                ) then
+
+                update(input)
+            end
+        end
+    )
+end
+
+--// ------------------------------------------------------------
+--// PIECE HUD
+--// One compact card:
+--//    YOU
+--//    ENEMY
+--//
+--// Piece graphics are ViewportFrames rendering cloned chess models
+--// from currentMatch itself. No Unicode chess font is required.
+--// ------------------------------------------------------------
+
+local PieceStackHUD =
     NewHUDFrame(
-        "YouPiecesHUD",
-        UDim2.fromOffset(232, 54),
-        UDim2.new(0, 14, 0, 76),
+        "PieceStackHUD",
+        UDim2.fromOffset(218, 104),
+        UDim2.new(0, 12, 0, 134),
         Vector2.new(0, 0)
     )
 
-local YouTitle =
-    Instance.new("TextLabel")
+local Divider =
+    Instance.new("Frame")
 
-YouTitle.Position =
-    UDim2.fromOffset(9, 5)
+Divider.Position =
+    UDim2.new(0, 8, 0.5, 0)
 
-YouTitle.Size =
-    UDim2.new(1, -18, 0, 16)
+Divider.Size =
+    UDim2.new(1, -16, 0, 1)
 
-YouTitle.BackgroundTransparency = 1
-YouTitle.Font = Enum.Font.GothamBold
-YouTitle.Text = "YOU"
-YouTitle.TextSize = 10
-YouTitle.TextColor3 =
-    Color3.fromRGB(235, 238, 245)
+Divider.BackgroundColor3 =
+    Color3.fromRGB(66, 69, 80)
 
-YouTitle.TextXAlignment =
-    Enum.TextXAlignment.Left
+Divider.BackgroundTransparency = 0.35
+Divider.BorderSizePixel = 0
+Divider.ZIndex = 7
+Divider.Parent = PieceStackHUD
 
-YouTitle.ZIndex = 7
-YouTitle.Parent = YouHUD
+local function NewPieceRow(
+    parent,
+    y,
+    titleText,
+    titleAlign
+)
+    local row =
+        Instance.new("Frame")
 
-local YouPieces =
-    Instance.new("TextLabel")
+    row.Position =
+        UDim2.fromOffset(0, y)
 
-YouPieces.Position =
-    UDim2.fromOffset(9, 22)
+    row.Size =
+        UDim2.new(1, 0, 0, 51)
 
-YouPieces.Size =
-    UDim2.new(1, -18, 0, 25)
+    row.BackgroundTransparency = 1
+    row.ZIndex = 7
+    row.Parent = parent
 
-YouPieces.BackgroundTransparency = 1
-YouPieces.Font = Enum.Font.Gotham
-YouPieces.Text =
-    "♕1  ♖2  ♗2  ♘2  ♙8"
+    local title =
+        Instance.new("TextLabel")
 
-YouPieces.TextSize = 14
-YouPieces.TextColor3 =
-    Color3.fromRGB(220, 224, 234)
+    title.Position =
+        UDim2.fromOffset(8, 4)
 
-YouPieces.TextXAlignment =
-    Enum.TextXAlignment.Left
+    title.Size =
+        UDim2.fromOffset(54, 14)
 
-YouPieces.ZIndex = 7
-YouPieces.Parent = YouHUD
+    title.BackgroundTransparency = 1
+    title.Font = Enum.Font.GothamBold
+    title.Text = titleText
+    title.TextSize = 8
 
--- ENEMY / right ------------------------------------------------
+    title.TextColor3 =
+        Color3.fromRGB(210, 214, 225)
 
-local EnemyHUD =
-    NewHUDFrame(
-        "EnemyPiecesHUD",
-        UDim2.fromOffset(232, 54),
-        UDim2.new(1, -14, 0, 76),
-        Vector2.new(1, 0)
+    title.TextXAlignment =
+        titleAlign
+        or Enum.TextXAlignment.Left
+
+    title.ZIndex = 8
+    title.Parent = row
+
+    local cells = {}
+    local order = {"Q", "R", "B", "N", "P"}
+
+    for index, letter in ipairs(order) do
+        local cell =
+            Instance.new("Frame")
+
+        cell.Position =
+            UDim2.fromOffset(
+                57 + (index - 1) * 30,
+                3
+            )
+
+        cell.Size =
+            UDim2.fromOffset(29, 45)
+
+        cell.BackgroundTransparency = 1
+        cell.ZIndex = 8
+        cell.Parent = row
+
+        local viewport =
+            Instance.new("ViewportFrame")
+
+        viewport.Name =
+            "Icon_" .. letter
+
+        viewport.Position =
+            UDim2.fromOffset(2, 0)
+
+        viewport.Size =
+            UDim2.fromOffset(25, 29)
+
+        viewport.BackgroundTransparency = 1
+        viewport.BorderSizePixel = 0
+
+        viewport.Ambient =
+            Color3.fromRGB(190, 190, 200)
+
+        viewport.LightColor =
+            Color3.fromRGB(255, 255, 255)
+
+        viewport.LightDirection =
+            Vector3.new(-1, -1, -1)
+
+        viewport.ZIndex = 8
+        viewport.Parent = cell
+
+        -- Only shown if cloning/rendering a game model is unavailable.
+        -- Uses simple ASCII letters, never unsupported  glyphs.
+        local fallback =
+            Instance.new("TextLabel")
+
+        fallback.Size =
+            UDim2.fromScale(1, 1)
+
+        fallback.BackgroundTransparency = 1
+        fallback.Font = Enum.Font.GothamBold
+        fallback.Text = letter
+        fallback.TextSize = 13
+
+        fallback.TextColor3 =
+            Color3.fromRGB(205, 209, 220)
+
+        fallback.Visible = true
+        fallback.ZIndex = 9
+        fallback.Parent = viewport
+
+        local count =
+            Instance.new("TextLabel")
+
+        count.Position =
+            UDim2.fromOffset(0, 29)
+
+        count.Size =
+            UDim2.fromOffset(29, 13)
+
+        count.BackgroundTransparency = 1
+        count.Font = Enum.Font.GothamMedium
+        count.Text = "0"
+        count.TextSize = 8
+
+        count.TextColor3 =
+            Color3.fromRGB(195, 199, 211)
+
+        count.TextXAlignment =
+            Enum.TextXAlignment.Center
+
+        count.ZIndex = 8
+        count.Parent = cell
+
+        cells[letter] = {
+            viewport = viewport,
+            fallback = fallback,
+            count = count,
+        }
+    end
+
+    return row, title, cells
+end
+
+local YouHUD,
+    YouTitle,
+    YouPieceCells =
+    NewPieceRow(
+        PieceStackHUD,
+        0,
+        "YOU",
+        Enum.TextXAlignment.Left
     )
 
-local EnemyTitle =
-    Instance.new("TextLabel")
+local EnemyHUD,
+    EnemyTitle,
+    EnemyPieceCells =
+    NewPieceRow(
+        PieceStackHUD,
+        52,
+        "ENEMY",
+        Enum.TextXAlignment.Left
+    )
 
-EnemyTitle.Position =
-    UDim2.fromOffset(9, 5)
+local PieceIconSourceCache = {}
 
-EnemyTitle.Size =
-    UDim2.new(1, -18, 0, 16)
+local function ClearViewport(viewport)
+    for _, child in ipairs(
+        viewport:GetChildren()
+    ) do
+        if child:IsA("Camera")
+            or child:IsA("WorldModel") then
 
-EnemyTitle.BackgroundTransparency = 1
-EnemyTitle.Font = Enum.Font.GothamBold
-EnemyTitle.Text = "ENEMY"
-EnemyTitle.TextSize = 10
-EnemyTitle.TextColor3 =
-    Color3.fromRGB(170, 175, 190)
+            child:Destroy()
+        end
+    end
+end
 
-EnemyTitle.TextXAlignment =
-    Enum.TextXAlignment.Right
+local function RenderGamePieceIcon(
+    cell,
+    sourceObject
+)
+    if not cell
+        or not cell.viewport then
 
-EnemyTitle.ZIndex = 7
-EnemyTitle.Parent = EnemyHUD
+        return
+    end
 
-local EnemyPieces =
-    Instance.new("TextLabel")
+    local viewport = cell.viewport
 
-EnemyPieces.Position =
-    UDim2.fromOffset(9, 22)
+    -- If that exact source is already rendered, do nothing.
+    if sourceObject
+        and PieceIconSourceCache[viewport]
+            == sourceObject
+        and viewport:FindFirstChildOfClass(
+            "WorldModel"
+        ) then
 
-EnemyPieces.Size =
-    UDim2.new(1, -18, 0, 25)
+        cell.fallback.Visible = false
+        return
+    end
 
-EnemyPieces.BackgroundTransparency = 1
-EnemyPieces.Font = Enum.Font.Gotham
-EnemyPieces.Text =
-    "♟8  ♞2  ♝2  ♜2  ♛1"
+    if typeof(sourceObject) ~= "Instance" then
+        -- Keep an existing rendered model even if this piece type has
+        -- just been captured and no current sample remains.
+        if viewport:FindFirstChildOfClass(
+            "WorldModel"
+        ) then
 
-EnemyPieces.TextSize = 14
-EnemyPieces.TextColor3 =
-    Color3.fromRGB(178, 183, 197)
+            cell.fallback.Visible = false
+            return
+        end
 
-EnemyPieces.TextXAlignment =
-    Enum.TextXAlignment.Right
+        cell.fallback.Visible = true
+        return
+    end
 
-EnemyPieces.ZIndex = 7
-EnemyPieces.Parent = EnemyHUD
+    local clone
 
--- Eval / top center --------------------------------------------
+    local okClone =
+        pcall(function()
+            local oldArchivable =
+                sourceObject.Archivable
+
+            sourceObject.Archivable = true
+            clone = sourceObject:Clone()
+            sourceObject.Archivable =
+                oldArchivable
+        end)
+
+    if not okClone
+        or typeof(clone) ~= "Instance" then
+
+        cell.fallback.Visible = true
+        return
+    end
+
+    ClearViewport(viewport)
+
+    local world =
+        Instance.new("WorldModel")
+
+    world.Parent = viewport
+
+    -- Remove behavior from cloned visual model.
+    for _, descendant in ipairs(
+        clone:GetDescendants()
+    ) do
+        if descendant:IsA("Script")
+            or descendant:IsA("LocalScript") then
+
+            descendant:Destroy()
+
+        elseif descendant:IsA("BasePart") then
+            descendant.Anchored = true
+            descendant.CanCollide = false
+            descendant.CanTouch = false
+            descendant.CanQuery = false
+        end
+    end
+
+    if clone:IsA("BasePart") then
+        clone.Anchored = true
+        clone.CanCollide = false
+        clone.CanTouch = false
+        clone.CanQuery = false
+    end
+
+    clone.Parent = world
+
+    local center
+    local size
+
+    if clone:IsA("Model") then
+        local okBox, boxCF, boxSize =
+            pcall(function()
+                local cf, s =
+                    clone:GetBoundingBox()
+
+                return cf, s
+            end)
+
+        if okBox then
+            center = boxCF.Position
+            size = boxSize
+        end
+
+    elseif clone:IsA("BasePart") then
+        center = clone.Position
+        size = clone.Size
+    end
+
+    if not center or not size then
+        clone:Destroy()
+        world:Destroy()
+        cell.fallback.Visible = true
+        return
+    end
+
+    local maxSize =
+        math.max(
+            size.X,
+            size.Y,
+            size.Z,
+            0.5
+        )
+
+    local camera =
+        Instance.new("Camera")
+
+    camera.FieldOfView = 32
+
+    local target =
+        center
+        + Vector3.new(
+            0,
+            size.Y * 0.05,
+            0
+        )
+
+    local distance =
+        maxSize * 2.25
+
+    camera.CFrame =
+        CFrame.lookAt(
+            target
+                + Vector3.new(
+                    distance * 0.55,
+                    distance * 0.28,
+                    distance
+                ),
+            target
+        )
+
+    camera.Parent = viewport
+    viewport.CurrentCamera = camera
+
+    PieceIconSourceCache[viewport] =
+        sourceObject
+
+    cell.fallback.Visible = false
+end
+
+local function UpdatePieceRow(
+    cells,
+    counts,
+    samples
+)
+    local order = {"Q", "R", "B", "N", "P"}
+
+    for _, letter in ipairs(order) do
+        local cell = cells[letter]
+
+        if cell then
+            cell.count.Text =
+                tostring(
+                    counts[letter]
+                    or 0
+                )
+
+            RenderGamePieceIcon(
+                cell,
+                samples
+                    and samples[letter]
+                    or nil
+            )
+        end
+    end
+end
+
+--// ------------------------------------------------------------
+--// EVALUATION HUD
+--// ------------------------------------------------------------
 
 local EvalHUD =
     NewHUDFrame(
         "EvaluationHUD",
-        UDim2.fromOffset(262, 59),
-        UDim2.new(0.5, 0, 0, 74),
+        UDim2.fromOffset(205, 50),
+        UDim2.new(0.5, 0, 0, 76),
         Vector2.new(0.5, 0)
     )
 
@@ -2890,15 +3294,16 @@ local MaterialLabel =
     Instance.new("TextLabel")
 
 MaterialLabel.Position =
-    UDim2.fromOffset(8, 4)
+    UDim2.fromOffset(7, 3)
 
 MaterialLabel.Size =
-    UDim2.new(1, -16, 0, 14)
+    UDim2.new(1, -14, 0, 13)
 
 MaterialLabel.BackgroundTransparency = 1
 MaterialLabel.Font = Enum.Font.GothamMedium
-MaterialLabel.Text = "MATERIAL  +0"
-MaterialLabel.TextSize = 9
+MaterialLabel.Text = "MATERIAL +0"
+MaterialLabel.TextSize = 8
+
 MaterialLabel.TextColor3 =
     Color3.fromRGB(171, 177, 194)
 
@@ -2912,15 +3317,16 @@ local WinLabel =
     Instance.new("TextLabel")
 
 WinLabel.Position =
-    UDim2.fromOffset(8, 20)
+    UDim2.fromOffset(7, 17)
 
 WinLabel.Size =
-    UDim2.new(1, -16, 0, 18)
+    UDim2.new(1, -14, 0, 16)
 
 WinLabel.BackgroundTransparency = 1
 WinLabel.Font = Enum.Font.GothamBold
-WinLabel.Text = "EST. WIN  --%   •   EVAL --"
-WinLabel.TextSize = 10
+WinLabel.Text = "WIN --%  •  EVAL --"
+WinLabel.TextSize = 9
+
 WinLabel.TextColor3 =
     Color3.fromRGB(215, 220, 233)
 
@@ -2934,10 +3340,10 @@ local WinBar =
     Instance.new("Frame")
 
 WinBar.Position =
-    UDim2.fromOffset(12, 43)
+    UDim2.fromOffset(10, 38)
 
 WinBar.Size =
-    UDim2.new(1, -24, 0, 6)
+    UDim2.new(1, -20, 0, 5)
 
 WinBar.BackgroundColor3 =
     Color3.fromRGB(52, 55, 66)
@@ -2971,13 +3377,15 @@ Instance.new(
 ).CornerRadius =
     UDim.new(1, 0)
 
--- Move + predicted reply / center -------------------------------
+--// ------------------------------------------------------------
+--// MOVE / PREDICTION HUD
+--// ------------------------------------------------------------
 
 local MoveHUD =
     NewHUDFrame(
         "MovePredictionHUD",
-        UDim2.fromOffset(320, 52),
-        UDim2.new(0.5, 0, 0, 141),
+        UDim2.fromOffset(245, 47),
+        UDim2.new(0.5, 0, 0, 132),
         Vector2.new(0.5, 0)
     )
 
@@ -2985,15 +3393,16 @@ local AIMoveLabel =
     Instance.new("TextLabel")
 
 AIMoveLabel.Position =
-    UDim2.fromOffset(10, 5)
+    UDim2.fromOffset(8, 3)
 
 AIMoveLabel.Size =
-    UDim2.new(1, -20, 0, 19)
+    UDim2.new(1, -16, 0, 19)
 
 AIMoveLabel.BackgroundTransparency = 1
 AIMoveLabel.Font = Enum.Font.GothamMedium
-AIMoveLabel.Text = "AI  •  --"
-AIMoveLabel.TextSize = 10
+AIMoveLabel.Text = "AI • --"
+AIMoveLabel.TextSize = 9
+
 AIMoveLabel.TextColor3 =
     Color3.fromRGB(126, 190, 245)
 
@@ -3007,15 +3416,16 @@ local EnemyMoveLabel =
     Instance.new("TextLabel")
 
 EnemyMoveLabel.Position =
-    UDim2.fromOffset(10, 27)
+    UDim2.fromOffset(8, 23)
 
 EnemyMoveLabel.Size =
-    UDim2.new(1, -20, 0, 19)
+    UDim2.new(1, -16, 0, 19)
 
 EnemyMoveLabel.BackgroundTransparency = 1
 EnemyMoveLabel.Font = Enum.Font.GothamMedium
-EnemyMoveLabel.Text = "ENEMY  •  --"
-EnemyMoveLabel.TextSize = 10
+EnemyMoveLabel.Text = "ENEMY • --"
+EnemyMoveLabel.TextSize = 9
+
 EnemyMoveLabel.TextColor3 =
     Color3.fromRGB(235, 135, 125)
 
@@ -3025,13 +3435,15 @@ EnemyMoveLabel.TextXAlignment =
 EnemyMoveLabel.ZIndex = 7
 EnemyMoveLabel.Parent = MoveHUD
 
--- Thinking / bottom center -------------------------------------
+--// ------------------------------------------------------------
+--// THINKING HUD
+--// ------------------------------------------------------------
 
 local ThinkingCard =
     NewHUDFrame(
         "ThinkingHUD",
-        UDim2.fromOffset(430, 78),
-        UDim2.new(0.5, 0, 1, -24),
+        UDim2.fromOffset(315, 66),
+        UDim2.new(0.5, 0, 1, -20),
         Vector2.new(0.5, 1)
     )
 
@@ -3039,15 +3451,16 @@ local ThinkingTitle =
     Instance.new("TextLabel")
 
 ThinkingTitle.Position =
-    UDim2.fromOffset(10, 6)
+    UDim2.fromOffset(8, 5)
 
 ThinkingTitle.Size =
-    UDim2.new(1, -20, 0, 15)
+    UDim2.new(1, -16, 0, 14)
 
 ThinkingTitle.BackgroundTransparency = 1
 ThinkingTitle.Font = Enum.Font.GothamBold
 ThinkingTitle.Text = "NỘI TÂM • TELEMETRY"
-ThinkingTitle.TextSize = 9
+ThinkingTitle.TextSize = 8
+
 ThinkingTitle.TextColor3 =
     Color3.fromRGB(155, 166, 205)
 
@@ -3061,21 +3474,24 @@ local ThinkingText =
     Instance.new("TextLabel")
 
 ThinkingText.Position =
-    UDim2.fromOffset(10, 23)
+    UDim2.fromOffset(8, 21)
 
 ThinkingText.Size =
-    UDim2.new(1, -20, 0, 47)
+    UDim2.new(1, -16, 0, 39)
 
 ThinkingText.BackgroundTransparency = 1
 ThinkingText.Font = Enum.Font.Gotham
+
 ThinkingText.Text =
     "Chưa phân tích. Automatic sẽ tự chọn độ sâu theo thế cờ."
 
-ThinkingText.TextSize = 9
+ThinkingText.TextSize = 8
+
 ThinkingText.TextColor3 =
     Color3.fromRGB(190, 194, 207)
 
 ThinkingText.TextWrapped = true
+
 ThinkingText.TextXAlignment =
     Enum.TextXAlignment.Left
 
@@ -3085,12 +3501,24 @@ ThinkingText.TextYAlignment =
 ThinkingText.ZIndex = 7
 ThinkingText.Parent = ThinkingCard
 
+-- Every HUD is independently draggable.
+MakeHUDDraggable(PieceStackHUD)
+MakeHUDDraggable(EvalHUD)
+MakeHUDDraggable(MoveHUD)
+MakeHUDDraggable(ThinkingCard)
+
 local function RefreshHUDVisibility()
-    YouHUD.Visible = Config.ShowPieceHUD
-    EnemyHUD.Visible = Config.ShowPieceHUD
-    EvalHUD.Visible = Config.ShowEvalHUD
-    MoveHUD.Visible = Config.ShowMoveHUD
-    ThinkingCard.Visible = Config.ShowThinkingHUD
+    PieceStackHUD.Visible =
+        Config.ShowPieceHUD
+
+    EvalHUD.Visible =
+        Config.ShowEvalHUD
+
+    MoveHUD.Visible =
+        Config.ShowMoveHUD
+
+    ThinkingCard.Visible =
+        Config.ShowThinkingHUD
 end
 
 SetThinkingNarrative =
@@ -3108,6 +3536,7 @@ SetThinkingNarrative =
                     190,
                     142
                 )
+
         elseif kind == "hesitate" then
             ThinkingTitle.Text =
                 "NỘI TÂM • ĐANG CHỜ"
@@ -3118,6 +3547,7 @@ SetThinkingNarrative =
                     181,
                     105
                 )
+
         elseif kind == "warning" then
             ThinkingTitle.Text =
                 "NỘI TÂM • FALLBACK"
@@ -3128,6 +3558,7 @@ SetThinkingNarrative =
                     142,
                     126
                 )
+
         else
             ThinkingTitle.Text =
                 "NỘI TÂM • TELEMETRY"
@@ -3151,13 +3582,13 @@ local function ResetAnalysisHUD()
     LastHUDWin = nil
 
     WinLabel.Text =
-        "EST. WIN  --%   •   EVAL --"
+        "WIN --%  •  EVAL --"
 
     WinFill.Size =
         UDim2.new(0.5, 0, 1, 0)
 
-    AIMoveLabel.Text = "AI  •  --"
-    EnemyMoveLabel.Text = "ENEMY  •  --"
+    AIMoveLabel.Text = "AI • --"
+    EnemyMoveLabel.Text = "ENEMY • --"
 
     SetThinkingNarrative(
         "Chưa phân tích. Automatic sẽ tự tăng/giảm độ sâu theo thế cờ.",
@@ -3174,10 +3605,24 @@ local function UpdatePieceHUD(
 
         YouTitle.Text = "YOU"
         EnemyTitle.Text = "ENEMY"
-        YouPieces.Text = "--"
-        EnemyPieces.Text = "--"
+
+        local blank =
+            EmptyPieceCounts()
+
+        UpdatePieceRow(
+            YouPieceCells,
+            blank,
+            nil
+        )
+
+        UpdatePieceRow(
+            EnemyPieceCells,
+            blank,
+            nil
+        )
+
         MaterialLabel.Text =
-            "Material  --"
+            "MATERIAL --"
 
         return
     end
@@ -3185,13 +3630,15 @@ local function UpdatePieceHUD(
     local enemyTeam =
         not localTeam
 
-    local you =
+    local you,
+        youSamples =
         CountTeamPieces(
             match,
             localTeam
         )
 
-    local enemy =
+    local enemy,
+        enemySamples =
         CountTeamPieces(
             match,
             enemyTeam
@@ -3216,47 +3663,47 @@ local function UpdatePieceHUD(
     YouTitle.TextColor3 =
         localTeam
         and Color3.fromRGB(
+            238,
             240,
-            241,
-            245
+            246
         )
         or Color3.fromRGB(
-            155,
-            160,
-            174
+            171,
+            176,
+            190
         )
 
     EnemyTitle.TextColor3 =
         enemyTeam
         and Color3.fromRGB(
+            238,
             240,
-            241,
-            245
+            246
         )
         or Color3.fromRGB(
-            155,
-            160,
-            174
+            171,
+            176,
+            190
         )
 
-    YouPieces.Text =
-        FormatPieceCounts(
-            you,
-            localTeam
-        )
+    UpdatePieceRow(
+        YouPieceCells,
+        you,
+        youSamples
+    )
 
-    EnemyPieces.Text =
-        FormatPieceCounts(
-            enemy,
-            enemyTeam
-        )
+    UpdatePieceRow(
+        EnemyPieceCells,
+        enemy,
+        enemySamples
+    )
 
     local delta =
         MaterialScore(you)
         - MaterialScore(enemy)
 
     MaterialLabel.Text =
-        "MATERIAL  "
+        "MATERIAL "
         .. (
             delta > 0
             and "+"
@@ -3282,7 +3729,7 @@ local function SetAnalysisHUD(
 
     WinLabel.Text =
         string.format(
-            "EST. WIN  %d%%   •   EVAL %+.2f",
+            "WIN %d%%  •  EVAL %+.2f",
             win,
             (tonumber(score) or 0) / 100
         )
@@ -3299,7 +3746,7 @@ local function SetAnalysisHUD(
         (
             emergency
             and "AI* • "
-            or "AI  • "
+            or "AI • "
         )
         .. tostring(moveText or "--")
 
@@ -3315,16 +3762,16 @@ local function SetAnalysisHUD(
 
         EnemyMoveLabel.Text =
             string.format(
-                "ENEMY  •  %s   •   %d%%",
+                "ENEMY • %s  •  %d%%",
                 enemyText,
                 prediction.confidence or 0
             )
     elseif Config.EnemyPrediction then
         EnemyMoveLabel.Text =
-            "ENEMY  •  prediction unavailable"
+            "ENEMY • prediction unavailable"
     else
         EnemyMoveLabel.Text =
-            "ENEMY  •  prediction OFF"
+            "ENEMY • prediction OFF"
     end
 end
 
@@ -3578,7 +4025,7 @@ NewToggleRow(
 
         if not v then
             EnemyMoveLabel.Text =
-                "ENEMY  •  prediction OFF"
+                "ENEMY • prediction OFF"
         end
     end
 )
