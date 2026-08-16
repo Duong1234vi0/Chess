@@ -1,5 +1,5 @@
 --[[
-    Chess AI Client v4.7 - Automatic Tactical Safety
+    Chess AI Client v4.8 - Midgame Replay + Auto Resync
     Compact dropdown GUI + Original Game Sunfish + Visual Tracer
 
     Features
@@ -26,7 +26,7 @@
     - Best reliability: execute before a new match starts or at the very beginning.
     - In the game's built-in AI/sunfish mode, currentMatch.sunfishPos is reused read-only.
     - In other modes, the script maintains its own shadow Sunfish position from MovePiece traffic.
-    - If injected mid-match and no synced position can be established, the GUI reports SYNC REQUIRED.
+    - Mid-match injection rebuilds Shadow by replaying currentMatch.boardStates FEN history.
 
     Executor APIs used when available:
       getgc(), gethui()
@@ -57,8 +57,10 @@ assert(MovePieceRemote, "[ChessAI] MovePiece remote not found")
 local Modules = ReplicatedStorage:WaitForChild("Modules")
 local SunfishHandlerModule = Modules:WaitForChild("SunfishHandler")
 local SunfishModule = SunfishHandlerModule:WaitForChild("Sunfish")
+local GameBoardModuleScript = Modules:WaitForChild("Board")
 
 local Sunfish = require(SunfishModule)
+local GameBoard = require(GameBoardModuleScript)
 
 -- Ranked/PvP FIX:
 -- The game's setupBot() normally initializes this callback, but
@@ -898,6 +900,10 @@ local function ResolveGameMove(match, sunfishMove, position, expectedTeam)
         )
 end
 
+-- UI callbacks are assigned later after the HUD is constructed.
+local SetThinkingNarrative = function() end
+local SetStatus = function() end
+
 --// ============================================================
 --// SHADOW POSITION FOR NON-SUNFISH MATCHES
 --// ============================================================
@@ -910,6 +916,11 @@ local Shadow = {
 
     pendingKey = nil,
     pendingUntil = 0,
+
+    -- v4.8 replay/resync state.
+    resyncToken = 0,
+    historyPlies = 0,
+    lastSyncMethod = nil,
 }
 
 local function MoveKey(fromPos, toPos)
@@ -919,6 +930,747 @@ local function MoveKey(fromPos, toPos)
         tostring(toPos and toPos[1]),
         tostring(toPos and toPos[2]),
     }, ":")
+end
+
+
+--// ============================================================
+--// v4.8 MIDGAME FEN/HISTORY REPLAY
+--// ============================================================
+
+local PromotionNameFromFEN = {
+    Q = "Queen",
+    R = "Rook",
+    B = "Bishop",
+    N = "Knight",
+}
+
+local function IsFENString(value)
+    return type(value) == "string"
+        and string.find(
+            value,
+            "/",
+            1,
+            true
+        ) ~= nil
+end
+
+local function SplitWords(text)
+    local words = {}
+
+    for word in string.gmatch(
+        tostring(text or ""),
+        "%S+"
+    ) do
+        words[#words + 1] = word
+    end
+
+    return words
+end
+
+local function ParseFEN(fen)
+    if not IsFENString(fen) then
+        return nil
+    end
+
+    local fields =
+        SplitWords(fen)
+
+    local placement =
+        fields[1]
+
+    if not placement then
+        return nil
+    end
+
+    local ranks = {}
+
+    for rank in string.gmatch(
+        placement,
+        "[^/]+"
+    ) do
+        ranks[#ranks + 1] = rank
+    end
+
+    if #ranks ~= 8 then
+        return nil
+    end
+
+    local board = {}
+
+    for x = 1, 8 do
+        board[x] = {}
+    end
+
+    -- FEN rank order is 8 -> 1 and files are a -> h.
+    -- Game coordinates are mirrored on X:
+    --   a-file = x8, h-file = x1.
+    for fenRankIndex = 1, 8 do
+        local rankText =
+            ranks[fenRankIndex]
+
+        local y =
+            9 - fenRankIndex
+
+        local fileIndex = 1
+
+        for i = 1, #rankText do
+            local char =
+                string.sub(
+                    rankText,
+                    i,
+                    i
+                )
+
+            local digit =
+                tonumber(char)
+
+            if digit then
+                fileIndex += digit
+            else
+                if fileIndex < 1
+                    or fileIndex > 8 then
+
+                    return nil
+                end
+
+                local x =
+                    9 - fileIndex
+
+                board[x][y] = char
+                fileIndex += 1
+            end
+        end
+
+        if fileIndex ~= 9 then
+            return nil
+        end
+    end
+
+    return {
+        raw = fen,
+        placement = placement,
+        active =
+            fields[2]
+            or "w",
+        board = board,
+    }
+end
+
+local function FENPieceIsTeam(
+    char,
+    team
+)
+    if type(char) ~= "string"
+        or #char ~= 1 then
+
+        return false
+    end
+
+    if not string.match(
+        char,
+        "[prnbqkPRNBQK]"
+    ) then
+
+        return false
+    end
+
+    local upper =
+        string.upper(char)
+
+    local isWhite =
+        char == upper
+
+    return isWhite == team
+end
+
+local function InferMoveFromFEN(
+    beforeFEN,
+    afterFEN,
+    movingTeam
+)
+    local before =
+        ParseFEN(beforeFEN)
+
+    local after =
+        ParseFEN(afterFEN)
+
+    if not before or not after then
+        return nil,
+            "FEN PARSE FAILED"
+    end
+
+    local sources = {}
+    local destinations = {}
+
+    for x = 1, 8 do
+        for y = 1, 8 do
+            local old =
+                before.board[x][y]
+
+            local new =
+                after.board[x][y]
+
+            if old ~= new then
+                if FENPieceIsTeam(
+                    old,
+                    movingTeam
+                ) then
+
+                    sources[#sources + 1] = {
+                        x = x,
+                        y = y,
+                        char = old,
+                    }
+                end
+
+                if FENPieceIsTeam(
+                    new,
+                    movingTeam
+                ) then
+
+                    destinations[
+                        #destinations + 1
+                    ] = {
+                        x = x,
+                        y = y,
+                        char = new,
+                    }
+                end
+            end
+        end
+    end
+
+    -- Castling changes both King and Rook. Select the King pair.
+    if #sources >= 2
+        and #destinations >= 2 then
+
+        local kingChar =
+            movingTeam
+            and "K"
+            or "k"
+
+        local kingSource
+        local kingDestination
+
+        for _, item in ipairs(sources) do
+            if item.char == kingChar then
+                kingSource = item
+                break
+            end
+        end
+
+        for _, item in ipairs(destinations) do
+            if item.char == kingChar then
+                kingDestination = item
+                break
+            end
+        end
+
+        if kingSource
+            and kingDestination then
+
+            return {
+                from = {
+                    kingSource.x,
+                    kingSource.y,
+                },
+
+                to = {
+                    kingDestination.x,
+                    kingDestination.y,
+                },
+
+                promote = nil,
+                kind = "castling",
+            }
+        end
+    end
+
+    if #sources < 1
+        or #destinations < 1 then
+
+        return nil,
+            string.format(
+                "FEN DIFF AMBIGUOUS src=%d dst=%d",
+                #sources,
+                #destinations
+            )
+    end
+
+    local source
+
+    -- Promotion/en-passant/normal moves still have one moving source.
+    -- If multiple candidates somehow remain, prefer a Pawn source,
+    -- otherwise the first candidate.
+    if #sources == 1 then
+        source = sources[1]
+    else
+        local pawnChar =
+            movingTeam
+            and "P"
+            or "p"
+
+        for _, item in ipairs(sources) do
+            if item.char == pawnChar then
+                source = item
+                break
+            end
+        end
+
+        source =
+            source
+            or sources[1]
+    end
+
+    local destination
+
+    if #destinations == 1 then
+        destination =
+            destinations[1]
+    else
+        -- Prefer a destination whose piece differs from the source type.
+        -- This catches promotion.
+        for _, item in ipairs(destinations) do
+            if string.upper(item.char)
+                ~= string.upper(
+                    source.char
+                ) then
+
+                destination = item
+                break
+            end
+        end
+
+        destination =
+            destination
+            or destinations[1]
+    end
+
+    local promotion
+
+    if string.upper(source.char) == "P"
+        and string.upper(
+            destination.char
+        ) ~= "P" then
+
+        promotion =
+            string.upper(
+                destination.char
+            )
+    end
+
+    return {
+        from = {
+            source.x,
+            source.y,
+        },
+
+        to = {
+            destination.x,
+            destination.y,
+        },
+
+        promote = promotion,
+        kind =
+            promotion
+            and "promotion"
+            or "normal",
+    }
+end
+
+local function GetLiveFEN(match)
+    if type(match) ~= "table" then
+        return nil
+    end
+
+    local ok, fen =
+        pcall(function()
+            if type(
+                match.createFENLine
+            ) == "function" then
+
+                return match:createFENLine()
+            end
+
+            if type(
+                GameBoard.createFENLine
+            ) == "function" then
+
+                return GameBoard.createFENLine(
+                    match
+                )
+            end
+        end)
+
+    if ok
+        and IsFENString(fen) then
+
+        return fen
+    end
+
+    return nil
+end
+
+local function CollectFENHistory(match)
+    local history = {}
+
+    local function append(fen)
+        if not IsFENString(fen) then
+            return
+        end
+
+        if history[#history] ~= fen then
+            history[#history + 1] =
+                fen
+        end
+    end
+
+    append(match.startFEN)
+
+    local states =
+        match.boardStates
+
+    if type(states) == "table" then
+        -- Board.nextRound stores states in an array on the client.
+        -- Prefer numeric order. Also support table-wrapped FENs.
+        local numericKeys = {}
+
+        for key in pairs(states) do
+            if type(key) == "number" then
+                numericKeys[
+                    #numericKeys + 1
+                ] = key
+            end
+        end
+
+        table.sort(numericKeys)
+
+        for _, key in ipairs(
+            numericKeys
+        ) do
+            local state =
+                states[key]
+
+            if type(state) == "string" then
+                append(state)
+
+            elseif type(state) == "table" then
+                append(
+                    state.fen
+                    or state.FEN
+                    or state[1]
+                )
+            end
+        end
+    end
+
+    append(
+        GetLiveFEN(match)
+    )
+
+    return history
+end
+
+local function StandardInitialPlacement()
+    local parsed =
+        ParseFEN(
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+        )
+
+    return parsed
+        and parsed.placement
+        or nil
+end
+
+local STANDARD_INITIAL_PLACEMENT =
+    StandardInitialPlacement()
+
+local function ReplayShadowFromHistory(match)
+    if type(match) ~= "table" then
+        return nil,
+            "NO MATCH"
+    end
+
+    local history =
+        CollectFENHistory(
+            match
+        )
+
+    if #history < 1 then
+        return nil,
+            "NO FEN HISTORY"
+    end
+
+    local first =
+        ParseFEN(
+            history[1]
+        )
+
+    if not first then
+        return nil,
+            "START FEN INVALID"
+    end
+
+    -- The PvP/Ranked matches in this game use the standard start.
+    -- Do not silently invent an incorrect score for custom midgame FEN.
+    if first.placement
+        ~= STANDARD_INITIAL_PLACEMENT then
+
+        return nil,
+            "CUSTOM START FEN UNSUPPORTED"
+    end
+
+    local okCreate, position =
+        pcall(
+            Sunfish.createPosition,
+            Sunfish.initial
+        )
+
+    if not okCreate
+        or type(position) ~= "table" then
+
+        return nil,
+            "CREATE INITIAL POSITION FAILED"
+    end
+
+    local plies = 0
+
+    for index = 2, #history do
+        local beforeFEN =
+            history[index - 1]
+
+        local afterFEN =
+            history[index]
+
+        local inferred,
+            inferError =
+            InferMoveFromFEN(
+                beforeFEN,
+                afterFEN,
+                position.player
+            )
+
+        if not inferred then
+            return nil,
+                string.format(
+                    "REPLAY DIFF FAILED @%d: %s",
+                    index - 1,
+                    tostring(inferError)
+                )
+        end
+
+        local toMove = {
+            inferred.to[1],
+            inferred.to[2],
+        }
+
+        if inferred.promote then
+            local pieceName =
+                PromotionNameFromFEN[
+                    inferred.promote
+                ]
+
+            if pieceName then
+                toMove.promote = {
+                    pieceName =
+                        pieceName,
+                }
+            end
+        end
+
+        local sunfishMove =
+            MatchMoveToSunfish(
+                position,
+                inferred.from,
+                toMove
+            )
+
+        if not sunfishMove then
+            return nil,
+                string.format(
+                    "REPLAY MOVE NOT FOUND @%d (%d,%d -> %d,%d)",
+                    index - 1,
+                    inferred.from[1],
+                    inferred.from[2],
+                    inferred.to[1],
+                    inferred.to[2]
+                )
+        end
+
+        local okMove, nextPosition =
+            pcall(function()
+                return position:move(
+                    sunfishMove
+                )
+            end)
+
+        if not okMove
+            or type(nextPosition)
+                ~= "table" then
+
+            return nil,
+                string.format(
+                    "REPLAY POSITION FAILED @%d",
+                    index - 1
+                )
+        end
+
+        position =
+            nextPosition
+
+        plies += 1
+
+        -- Keep long midgame reconstruction responsive on mobile.
+        if plies % 8 == 0 then
+            task.wait()
+        end
+    end
+
+    -- Sanity: side-to-move should agree with game state.
+    if type(match.activeTeam) == "boolean"
+        and position.player
+            ~= match.activeTeam then
+
+        return nil,
+            string.format(
+                "REPLAY TURN MISMATCH engine=%s game=%s",
+                tostring(position.player),
+                tostring(match.activeTeam)
+            )
+    end
+
+    return position,
+        nil,
+        plies
+end
+
+local function AttemptShadowResync(
+    match,
+    reason
+)
+    if type(match) ~= "table"
+        or match.mode == "sunfish" then
+
+        return false,
+            "RESYNC NOT NEEDED"
+    end
+
+    local position,
+        replayError,
+        plies =
+        ReplayShadowFromHistory(
+            match
+        )
+
+    if not position then
+        Shadow.ready = false
+
+        Shadow.reason =
+            "RESYNC FAILED: "
+            .. tostring(
+                replayError
+            )
+
+        return false,
+            Shadow.reason
+    end
+
+    Shadow.matchId = match.id
+    Shadow.position = position
+    Shadow.ready = true
+
+    Shadow.pendingKey = nil
+    Shadow.pendingUntil = 0
+
+    Shadow.historyPlies =
+        plies or 0
+
+    Shadow.lastSyncMethod =
+        "FEN_HISTORY"
+
+    Shadow.reason =
+        string.format(
+            "RESYNCED • %d plies",
+            Shadow.historyPlies
+        )
+
+    return true,
+        Shadow.reason
+end
+
+local function ScheduleShadowResync(
+    match,
+    reason
+)
+    if type(match) ~= "table"
+        or match.mode == "sunfish" then
+
+        return
+    end
+
+    Shadow.resyncToken += 1
+
+    local token =
+        Shadow.resyncToken
+
+    Shadow.ready = false
+
+    Shadow.reason =
+        "RESYNCING: "
+        .. tostring(reason)
+
+    local matchId =
+        match.id
+
+    local function tryAfter(delaySeconds)
+        task.delay(
+            delaySeconds,
+            function()
+                if token
+                    ~= Shadow.resyncToken then
+
+                    return
+                end
+
+                local live =
+                    GetCurrentMatch()
+
+                if not live
+                    or live.id
+                        ~= matchId then
+
+                    return
+                end
+
+                local ok =
+                    AttemptShadowResync(
+                        live,
+                        reason
+                    )
+
+                if ok then
+                    SetThinkingNarrative(
+                        string.format(
+                            "Shadow đã tự đồng bộ lại từ board history (%d plies).",
+                            Shadow.historyPlies
+                        ),
+                        "decision"
+                    )
+
+                    SetStatus(
+                        "SHADOW RESYNCED",
+                        false
+                    )
+                end
+            end
+        )
+    end
+
+    -- First attempt after MatchClient has had time to update boardStates.
+    tryAfter(0.12)
+
+    -- Race-condition fallback for slower network/client bookkeeping.
+    tryAfter(0.42)
 end
 
 local function ResetShadow(match)
@@ -932,12 +1684,14 @@ local function ResetShadow(match)
     Shadow.pendingKey = nil
     Shadow.pendingUntil = 0
 
+    Shadow.resyncToken += 1
+    Shadow.historyPlies = 0
+    Shadow.lastSyncMethod = nil
+
     if not match then
         return
     end
 
-    -- If the actual match already owns a Sunfish position,
-    -- we do not need a shadow position.
     if match.mode == "sunfish"
         and type(match.sunfishPos) == "table" then
 
@@ -946,11 +1700,10 @@ local function ResetShadow(match)
     end
 
     local atBeginning =
-        (match.movesPGN == nil or match.movesPGN == "")
-        and (
+        (
             match.round == nil
             or tonumber(match.round) == nil
-            or tonumber(match.round) <= 2
+            or tonumber(match.round) <= 1
         )
 
     if atBeginning then
@@ -960,16 +1713,33 @@ local function ResetShadow(match)
                 Sunfish.initial
             )
 
-        if ok and type(position) == "table" then
+        if ok
+            and type(position) == "table" then
+
             Shadow.position = position
             Shadow.ready = true
-            Shadow.reason = "SYNCED FROM START"
-        else
-            Shadow.reason = "CREATE POSITION FAILED"
+            Shadow.reason =
+                "SYNCED FROM START"
+
+            Shadow.lastSyncMethod =
+                "INITIAL"
+
+            return
         end
-    else
+    end
+
+    -- v4.8: Injecting midgame is supported by replaying the Board module's
+    -- FEN history through Sunfish's own legal move generator.
+    local ok =
+        AttemptShadowResync(
+            match,
+            "MIDGAME INIT"
+        )
+
+    if not ok then
         Shadow.reason =
-            "MIDGAME: START NEXT MATCH"
+            Shadow.reason
+            or "MIDGAME RESYNC FAILED"
     end
 end
 
@@ -1023,8 +1793,13 @@ local function AdvanceShadowAfterOwnMove(
     if expectedPosition
         and Shadow.position ~= expectedPosition then
 
+        ScheduleShadowResync(
+            match,
+            "LOCAL COMMIT POSITION CHANGED"
+        )
+
         return false,
-            "SHADOW CHANGED BEFORE LOCAL COMMIT"
+            "SHADOW CHANGED • RESYNCING"
     end
 
     local ok, nextPosition =
@@ -1040,6 +1815,11 @@ local function AdvanceShadowAfterOwnMove(
         Shadow.ready = false
         Shadow.reason =
             "DESYNC: LOCAL SHADOW UPDATE FAILED"
+
+        ScheduleShadowResync(
+            match,
+            "LOCAL SHADOW UPDATE"
+        )
 
         return false,
             Shadow.reason
@@ -1127,6 +1907,18 @@ local function ApplyConfirmedMoveToShadow(fromPos, toMove)
         Shadow.reason =
             "DESYNC: MOVE CONVERSION FAILED (REMOTE MOVE)"
 
+        local live =
+            GetCurrentMatch()
+
+        if live
+            and live.id == Shadow.matchId then
+
+            ScheduleShadowResync(
+                live,
+                "REMOTE MOVE CONVERSION"
+            )
+        end
+
         return
     end
 
@@ -1141,6 +1933,18 @@ local function ApplyConfirmedMoveToShadow(fromPos, toMove)
         Shadow.ready = false
         Shadow.reason =
             "DESYNC: POSITION UPDATE FAILED"
+
+        local live =
+            GetCurrentMatch()
+
+        if live
+            and live.id == Shadow.matchId then
+
+            ScheduleShadowResync(
+                live,
+                "REMOTE POSITION UPDATE"
+            )
+        end
 
         return
     end
@@ -1233,7 +2037,7 @@ local function CandidateMovesFromSearch(results)
     return output
 end
 
-local SetThinkingNarrative = function()
+SetThinkingNarrative = function()
 end
 
 local function MoveIdentity(move)
@@ -5005,7 +5809,7 @@ Status.TextTruncate =
 
 Status.Parent = Body
 
-local function SetStatus(text, bad)
+SetStatus = function(text, bad)
     text = tostring(text)
 
     HeaderTitle.Text =
