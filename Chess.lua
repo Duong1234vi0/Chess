@@ -1,5 +1,5 @@
 --[[
-    Chess AI Client v4.8 - Midgame Replay + Auto Resync
+    Chess AI Client v4.9 - Competitive Anti-Engine
     Compact dropdown GUI + Original Game Sunfish + Visual Tracer
 
     Features
@@ -111,6 +111,16 @@ local Config = {
     AutomaticSafetyCandidates = 4,
     AutomaticDefenseShortlist = 6,
 
+    -- Competitive / anti-engine mode.
+    -- This is intentionally much heavier than Automatic.
+    CompetitiveRootNodes = 120000,
+    CompetitiveProbeNodes = 35000,
+    CompetitiveDeepProbeNodes = 90000,
+    CompetitiveRecoveryNodes = 45000,
+    CompetitiveCandidateLimit = 4,
+    CompetitiveFinalists = 2,
+    CompetitiveMinDepth = 16,
+
     -- Enemy reply search uses a fraction of the selected mode's nodes
     -- so Nightmare does not perform two full 65k-node searches every turn.
     PredictionNodeFactor = 0.60,
@@ -121,12 +131,22 @@ local Config = {
     -- Keep tracer visible after recommendation.
     VisualLifetime = 4.0,
 
-    -- Loop interval.
+    -- Active match loop interval.
     PollRate = 0.12,
+
+    -- IMPORTANT:
+    -- Never run a full getgc() hunt every PollRate while sitting in lobby.
+    -- On mobile that means scanning tens of thousands of GC objects ~8x/sec.
+    MatchClientHuntActiveRate = 0.65,
+    MatchClientHuntIdleRate = 2.50,
+
+    -- Hide expensive HUD render layers while there is no active board.
+    SleepHUDInLobby = true,
 }
 
 local ModeOrder = {
     "Automatic",
+    "Competitive",
     "Baby",
     "Easy",
     "Normal",
@@ -277,12 +297,31 @@ local function MakeProfiles()
     nightmare.nodes = math.max(nightmare.nodes or 65536, 65536)
     nightmare.worseMoveChance = 0
 
+    local competitive =
+        DeepCopy(nightmare)
+
+    competitive.depth =
+        math.max(
+            competitive.depth or 20,
+            20
+        )
+
+    competitive.nodes = 120000
+    competitive.worseMoveChance = 0
+
+    competitive.lategameBonusDepth =
+        math.max(
+            competitive.lategameBonusDepth or 0,
+            100
+        )
+
     return {
         Baby = baby,
         Easy = easy,
         Normal = normal,
         Hard = hard,
         Nightmare = nightmare,
+        Competitive = competitive,
     }
 end
 
@@ -560,31 +599,96 @@ end
 
 local CachedMatchClient
 
-local function FindMatchClient()
-    if CachedMatchClient then
-        local ok, match = pcall(function()
-            return CachedMatchClient.currentMatch
-        end)
+-- Full getgc() walks are comparatively expensive on mobile.
+-- v4.8 used to perform this every 0.12s in lobby when currentMatch
+-- did not exist yet. Throttle the discovery pass heavily.
+local LastMatchClientHunt = -math.huge
+local LastKnownBoardActive = false
 
-        if ok and type(match) == "table" then
-            return CachedMatchClient
-        end
+local function CachedClientIsUsable(client)
+    if type(client) ~= "table" then
+        return false
+    end
+
+    return type(
+        rawget(client, "processRound")
+    ) == "function"
+        and type(
+            rawget(client, "movePiece")
+        ) == "function"
+end
+
+local function FindMatchClient(force)
+    if CachedMatchClient
+        and CachedClientIsUsable(
+            CachedMatchClient
+        ) then
+
+        return CachedMatchClient
     end
 
     if type(getgc) ~= "function" then
         return nil
     end
 
-    for _, object in ipairs(getgc(true)) do
-        if type(object) == "table" then
-            local currentMatch =
-                rawget(object, "currentMatch")
+    local now = os.clock()
 
-            if type(currentMatch) == "table"
-                and type(rawget(object, "processRound")) == "function"
-                and type(rawget(object, "movePiece")) == "function" then
+    local interval =
+        LastKnownBoardActive
+        and Config.MatchClientHuntActiveRate
+        or Config.MatchClientHuntIdleRate
 
-                CachedMatchClient = object
+    if not force
+        and now - LastMatchClientHunt
+            < interval then
+
+        return nil
+    end
+
+    LastMatchClientHunt = now
+
+    local okGC, objects =
+        pcall(
+            getgc,
+            true
+        )
+
+    if not okGC
+        or type(objects) ~= "table" then
+
+        return nil
+    end
+
+    for _, object in ipairs(objects) do
+        if type(object) == "table"
+            and CachedClientIsUsable(object) then
+
+            -- currentMatch may be nil while sitting in lobby.
+            -- Do NOT require it to exist in order to cache MatchClient.
+            --
+            -- Narrow candidates using the other known MatchClient methods.
+            if type(
+                rawget(
+                    object,
+                    "clickOnTile"
+                )
+            ) == "function"
+                and type(
+                    rawget(
+                        object,
+                        "startGame"
+                    )
+                ) == "function"
+                and type(
+                    rawget(
+                        object,
+                        "isInMatch"
+                    )
+                ) == "function" then
+
+                CachedMatchClient =
+                    object
+
                 return object
             end
         end
@@ -594,20 +698,33 @@ local function FindMatchClient()
 end
 
 local function GetCurrentMatch()
-    local client = FindMatchClient()
+    local client =
+        FindMatchClient(false)
 
     if not client then
+        LastKnownBoardActive = false
         return nil
     end
 
     local match =
-        rawget(client, "currentMatch")
+        rawget(
+            client,
+            "currentMatch"
+        )
 
     if type(match) ~= "table" then
+        LastKnownBoardActive = false
         return nil
     end
 
-    if not match.boardExists or match.gameEnded then
+    local active =
+        match.boardExists == true
+        and match.gameEnded ~= true
+
+    LastKnownBoardActive =
+        active
+
+    if not active then
         return nil
     end
 
@@ -3380,6 +3497,725 @@ local function AutomaticSearch(
         chosenInfo
 end
 
+
+--// ============================================================
+--// COMPETITIVE / ANTI-ENGINE MODE
+--//
+--// Outer adversarial verification:
+--//   1) Deep root search
+--//   2) Build executable candidate pool
+--//   3) Probe opponent's best response for every candidate
+--//   4) Deep-verify the safest finalists
+--//   5) Search our recovery after opponent's best response
+--//   6) Pick best worst-case line
+--//
+--// This is not Stockfish. It is a stronger controller around the
+--// game's Sunfish and therefore still has a lower ceiling than a
+--// modern native Stockfish build.
+--// ============================================================
+
+local function RunCompetitiveBudget(
+    position,
+    nodes,
+    minDepth,
+    label
+)
+    local settings =
+        DeepCopy(
+            Profiles.Competitive
+            or Profiles.Nightmare
+        )
+
+    settings.nodes =
+        math.max(
+            tonumber(nodes) or 65536,
+            1000
+        )
+
+    settings.depth =
+        math.max(
+            tonumber(settings.depth) or 10,
+            tonumber(minDepth)
+                or Config.CompetitiveMinDepth
+        )
+
+    settings.worseMoveChance = 0
+
+    local okSearch,
+        results,
+        mateState =
+        pcall(
+            Sunfish.search,
+            position,
+            settings.nodes,
+            settings.depth,
+            settings
+        )
+
+    if not okSearch then
+        return nil, {
+            error =
+                "COMP SEARCH ERROR ["
+                .. tostring(label)
+                .. "]: "
+                .. tostring(results),
+        }
+    end
+
+    if type(results) ~= "table"
+        or #results == 0 then
+
+        return nil, {
+            error =
+                "COMP NO RESULT ["
+                .. tostring(label)
+                .. "]",
+        }
+    end
+
+    local okChoose,
+        move,
+        score,
+        rank =
+        pcall(
+            Sunfish.chooseMove,
+            results,
+            settings
+        )
+
+    if not okChoose
+        or type(move) ~= "table" then
+
+        return nil, {
+            error =
+                "COMP CHOOSE FAILED ["
+                .. tostring(label)
+                .. "]",
+        }
+    end
+
+    return move, {
+        results = results,
+        candidates =
+            CandidateMovesFromSearch(
+                results
+            ),
+        score = tonumber(score)
+            or FinalSearchScore(results)
+            or 0,
+        rank = rank,
+        mateState = mateState,
+        settings = settings,
+        selectedMode = "Competitive",
+        candidateGap =
+            CandidateGap(results),
+    }
+end
+
+local function CompetitiveOpponentProbe(
+    position,
+    ourMove,
+    nodes,
+    label
+)
+    local okNext,
+        nextPosition =
+        pcall(function()
+            return position:move(
+                ourMove
+            )
+        end)
+
+    if not okNext
+        or type(nextPosition) ~= "table" then
+
+        return nil,
+            "COMP POSITION FAILED"
+    end
+
+    local enemyMove,
+        enemyInfo =
+        RunCompetitiveBudget(
+            nextPosition,
+            nodes,
+            Config.CompetitiveMinDepth,
+            label
+        )
+
+    if not enemyMove
+        or not enemyInfo then
+
+        return nil,
+            enemyInfo
+                and enemyInfo.error
+                or "COMP ENEMY SEARCH FAILED"
+    end
+
+    local enemyScore =
+        tonumber(enemyInfo.score)
+        or 0
+
+    local mateDanger =
+        (
+            type(enemyInfo.mateState)
+                == "number"
+            and enemyInfo.mateState > 0
+        )
+        or enemyScore >= 29000
+
+    return {
+        nextPosition = nextPosition,
+        enemyMove = enemyMove,
+        enemyInfo = enemyInfo,
+        enemyScore = enemyScore,
+        mateDanger = mateDanger,
+        severeDanger =
+            mateDanger
+            or enemyScore >= 1200,
+    }
+end
+
+local function AddCompetitiveCandidate(
+    pool,
+    seen,
+    match,
+    position,
+    team,
+    move,
+    ownScore,
+    source
+)
+    if type(move) ~= "table" then
+        return
+    end
+
+    local key =
+        MoveIdentity(move)
+
+    if seen[key] then
+        return
+    end
+
+    -- Competitive only spends expensive search budget on moves that
+    -- the game's own piece:getMoves() accepts.
+    local resolved =
+        ResolveGameMove(
+            match,
+            move,
+            position,
+            team
+        )
+
+    if not resolved then
+        return
+    end
+
+    seen[key] = true
+
+    pool[#pool + 1] = {
+        move = move,
+        ownScore =
+            tonumber(ownScore)
+            or -90000,
+        source = source,
+        resolved = resolved,
+    }
+end
+
+local function BuildCompetitiveCandidatePool(
+    match,
+    position,
+    team,
+    rootMove,
+    rootInfo
+)
+    local pool = {}
+    local seen = {}
+
+    AddCompetitiveCandidate(
+        pool,
+        seen,
+        match,
+        position,
+        team,
+        rootMove,
+        rootInfo
+            and rootInfo.score,
+        "root"
+    )
+
+    if rootInfo
+        and type(rootInfo.candidates)
+            == "table" then
+
+        for _, candidate in ipairs(
+            rootInfo.candidates
+        ) do
+            AddCompetitiveCandidate(
+                pool,
+                seen,
+                match,
+                position,
+                team,
+                candidate.move,
+                candidate.score,
+                "root-candidate"
+            )
+
+            if #pool
+                >= Config.CompetitiveCandidateLimit then
+
+                break
+            end
+        end
+    end
+
+    -- Fill missing slots using game-legal moves, ranked by the game's
+    -- Sunfish static move evaluation.
+    if #pool
+        < Config.CompetitiveCandidateLimit then
+
+        local legal =
+            ShortlistGameLegalDefenses(
+                match,
+                position,
+                team
+            )
+
+        for _, entry in ipairs(legal) do
+            AddCompetitiveCandidate(
+                pool,
+                seen,
+                match,
+                position,
+                team,
+                entry.move,
+                entry.ownScore,
+                "legal"
+            )
+
+            if #pool
+                >= Config.CompetitiveCandidateLimit then
+
+                break
+            end
+        end
+    end
+
+    return pool
+end
+
+local function CompetitiveRecoveryScore(
+    opponentAudit
+)
+    if type(opponentAudit) ~= "table"
+        or type(opponentAudit.enemyMove)
+            ~= "table"
+        or type(opponentAudit.nextPosition)
+            ~= "table" then
+
+        return 0,
+            nil
+    end
+
+    local okPosition,
+        ourPosition =
+        pcall(function()
+            return opponentAudit.nextPosition:move(
+                opponentAudit.enemyMove
+            )
+        end)
+
+    if not okPosition
+        or type(ourPosition) ~= "table" then
+
+        return 0,
+            nil
+    end
+
+    local ourMove,
+        ourInfo =
+        RunCompetitiveBudget(
+            ourPosition,
+            Config.CompetitiveRecoveryNodes,
+            14,
+            "RECOVERY"
+        )
+
+    if not ourMove
+        or not ourInfo then
+
+        return 0,
+            nil
+    end
+
+    return tonumber(ourInfo.score)
+            or 0,
+        ourInfo
+end
+
+local function CompetitiveUtility(
+    entry,
+    audit,
+    recoveryScore
+)
+    if audit.mateDanger then
+        return -1000000000
+    end
+
+    -- Opponent search is from the opponent's perspective:
+    -- lower enemyScore is better for us.
+    --
+    -- Recovery score is from our perspective after their best reply:
+    -- higher is better for us.
+    local utility =
+        -(
+            tonumber(audit.enemyScore)
+            or 0
+        )
+
+    utility +=
+        0.38
+        * (
+            tonumber(recoveryScore)
+            or 0
+        )
+
+    -- Small tie-break toward the move that root search liked.
+    utility +=
+        0.06
+        * (
+            tonumber(entry.ownScore)
+            or 0
+        )
+
+    return utility
+end
+
+local function CompetitiveSearch(
+    match,
+    position
+)
+    local team =
+        GetLocalTeam(match)
+
+    if type(team) ~= "boolean" then
+        return nil, {
+            error =
+                "COMPETITIVE: UNKNOWN TEAM",
+        }
+    end
+
+    SetThinkingNarrative(
+        string.format(
+            "Competitive: root search %dk nodes. Không dùng Easy/Normal và không majority vote.",
+            math.floor(
+                Config.CompetitiveRootNodes
+                / 1000
+            )
+        ),
+        "thinking"
+    )
+
+    local rootMove,
+        rootInfo =
+        RunCompetitiveBudget(
+            position,
+            Config.CompetitiveRootNodes,
+            Config.CompetitiveMinDepth,
+            "ROOT"
+        )
+
+    if not rootMove
+        or not rootInfo then
+
+        return nil,
+            rootInfo
+            or {
+                error =
+                    "COMPETITIVE ROOT FAILED",
+            }
+    end
+
+    local pool =
+        BuildCompetitiveCandidatePool(
+            match,
+            position,
+            team,
+            rootMove,
+            rootInfo
+        )
+
+    if #pool == 0 then
+        return rootMove,
+            rootInfo
+    end
+
+    SetThinkingNarrative(
+        string.format(
+            "Competitive: %d candidate hợp lệ. Đang giả lập best response của đối thủ...",
+            #pool
+        ),
+        "thinking"
+    )
+
+    local fastAudits = {}
+
+    for index, entry in ipairs(pool) do
+        SetThinkingNarrative(
+            string.format(
+                "Anti-engine probe %d/%d: đối thủ sẽ phản công thế nào?",
+                index,
+                #pool
+            ),
+            "thinking"
+        )
+
+        local audit =
+            CompetitiveOpponentProbe(
+                position,
+                entry.move,
+                Config.CompetitiveProbeNodes,
+                "PROBE "
+                    .. tostring(index)
+            )
+
+        if type(audit) == "table" then
+            fastAudits[#fastAudits + 1] = {
+                entry = entry,
+                audit = audit,
+            }
+        end
+
+        task.wait()
+    end
+
+    if #fastAudits == 0 then
+        rootInfo.competitive = {
+            candidateCount = #pool,
+            fallback = true,
+        }
+
+        return rootMove,
+            rootInfo
+    end
+
+    table.sort(
+        fastAudits,
+        function(a, b)
+            if a.audit.mateDanger
+                ~= b.audit.mateDanger then
+
+                return not a.audit.mateDanger
+            end
+
+            if a.audit.enemyScore
+                ~= b.audit.enemyScore then
+
+                return a.audit.enemyScore
+                    < b.audit.enemyScore
+            end
+
+            return a.entry.ownScore
+                > b.entry.ownScore
+        end
+    )
+
+    local finalistCount =
+        math.min(
+            #fastAudits,
+            Config.CompetitiveFinalists
+        )
+
+    SetThinkingNarrative(
+        string.format(
+            "Giữ %d finalist an toàn nhất. Bắt đầu deep adversarial verification...",
+            finalistCount
+        ),
+        "thinking"
+    )
+
+    local finals = {}
+
+    for i = 1, finalistCount do
+        local entry =
+            fastAudits[i].entry
+
+        SetThinkingNarrative(
+            string.format(
+                "Deep verify %d/%d • %dk nodes phản đòn.",
+                i,
+                finalistCount,
+                math.floor(
+                    Config.CompetitiveDeepProbeNodes
+                    / 1000
+                )
+            ),
+            "thinking"
+        )
+
+        local audit =
+            CompetitiveOpponentProbe(
+                position,
+                entry.move,
+                Config.CompetitiveDeepProbeNodes,
+                "DEEP "
+                    .. tostring(i)
+            )
+
+        if type(audit) == "table" then
+            local recoveryScore,
+                recoveryInfo =
+                CompetitiveRecoveryScore(
+                    audit
+                )
+
+            finals[#finals + 1] = {
+                entry = entry,
+                audit = audit,
+                recoveryScore =
+                    recoveryScore,
+                recoveryInfo =
+                    recoveryInfo,
+                utility =
+                    CompetitiveUtility(
+                        entry,
+                        audit,
+                        recoveryScore
+                    ),
+            }
+        end
+
+        task.wait()
+    end
+
+    if #finals == 0 then
+        local fallback =
+            fastAudits[1]
+
+        rootInfo.competitive = {
+            candidateCount = #pool,
+            finalistCount = 0,
+            fallback = true,
+            enemyScore =
+                fallback.audit.enemyScore,
+        }
+
+        return fallback.entry.move,
+            rootInfo
+    end
+
+    table.sort(
+        finals,
+        function(a, b)
+            if a.audit.mateDanger
+                ~= b.audit.mateDanger then
+
+                return not a.audit.mateDanger
+            end
+
+            return a.utility
+                > b.utility
+        end
+    )
+
+    local winner =
+        finals[1]
+
+    local selectedMove =
+        winner.entry.move
+
+    -- Preserve root telemetry, but update values that should represent
+    -- the actual selected competitive move.
+    local selectedInfo =
+        rootInfo
+
+    selectedInfo.selectedMode =
+        "Competitive"
+
+    selectedInfo.score =
+        -(
+            tonumber(
+                winner.audit.enemyScore
+            )
+            or 0
+        )
+
+    -- Root mateState may belong to a different root candidate after
+    -- adversarial verification changes the selected move.
+    selectedInfo.mateState = nil
+
+    selectedInfo.competitive = {
+        candidateCount = #pool,
+        finalistCount =
+            finalistCount,
+
+        enemyScore =
+            winner.audit.enemyScore,
+
+        recoveryScore =
+            winner.recoveryScore,
+
+        utility =
+            winner.utility,
+
+        mateDanger =
+            winner.audit.mateDanger,
+
+        source =
+            winner.entry.source,
+    }
+
+    -- Reuse the already-computed deep opponent line as Enemy Prediction,
+    -- avoiding one extra expensive search in Analyze().
+    selectedInfo.precomputedPrediction = {
+        move =
+            winner.audit.enemyMove,
+
+        position =
+            winner.audit.nextPosition,
+
+        score =
+            winner.audit.enemyScore,
+
+        results =
+            winner.audit.enemyInfo
+            and winner.audit.enemyInfo.results,
+
+        mateState =
+            winner.audit.enemyInfo
+            and winner.audit.enemyInfo.mateState,
+
+        confidence =
+            winner.audit.enemyInfo
+            and PredictionConfidence(
+                winner.audit.enemyInfo.results
+            )
+            or 0,
+    }
+
+    if winner.audit.mateDanger then
+        SetThinkingNarrative(
+            "Competitive cảnh báo: mọi finalist sâu đều cho đối thủ mating line. Đã chọn line kéo dài tốt nhất.",
+            "warning"
+        )
+    else
+        SetThinkingNarrative(
+            string.format(
+                "Competitive chốt worst-case line • enemy eval %+0.2f • recovery %+0.2f.",
+                winner.audit.enemyScore
+                    / 100,
+                winner.recoveryScore
+                    / 100
+            ),
+            "decision"
+        )
+    end
+
+    return selectedMove,
+        selectedInfo
+end
+
 local function SearchBestMove(match)
     local position, source =
         GetEnginePosition(match)
@@ -3395,6 +4231,13 @@ local function SearchBestMove(match)
     if Config.Mode == "Automatic" then
         bestMove, info =
             AutomaticSearch(
+                match,
+                position
+            )
+
+    elseif Config.Mode == "Competitive" then
+        bestMove, info =
+            CompetitiveSearch(
                 match,
                 position
             )
@@ -3426,7 +4269,9 @@ local function SearchBestMove(match)
     info.source = source
     info.position = position
 
-    if Config.Mode ~= "Automatic" then
+    if Config.Mode ~= "Automatic"
+        and Config.Mode ~= "Competitive" then
+
         SetThinkingNarrative(
             string.format(
                 "%s đã chốt nước. Khoảng cách ứng viên đầu: %.0f điểm.",
@@ -3452,6 +4297,12 @@ local function AutomaticMoveDelay(
     info,
     usedEmergency
 )
+    if Config.Mode == "Competitive" then
+        -- Search itself is already expensive; do not add fake human delay.
+        return 0.20,
+            false
+    end
+
     if Config.Mode ~= "Automatic"
         or not Config.AutomaticHumanDelay then
 
@@ -5197,6 +6048,31 @@ local function RefreshHUDVisibility()
         Config.ShowThinkingHUD
 end
 
+local HUDSleeping = false
+
+local function SetHUDSleeping(sleeping)
+    if not Config.SleepHUDInLobby then
+        sleeping = false
+    end
+
+    if HUDSleeping == sleeping then
+        return
+    end
+
+    HUDSleeping = sleeping
+
+    if sleeping then
+        -- Keep the compact settings bar available, but stop rendering
+        -- the independent HUD layers (including 10 ViewportFrames).
+        PieceStackHUD.Visible = false
+        EvalHUD.Visible = false
+        MoveHUD.Visible = false
+        ThinkingCard.Visible = false
+    else
+        RefreshHUDVisibility()
+    end
+end
+
 SetThinkingNarrative =
     function(text, kind)
         text = tostring(text or "")
@@ -6152,12 +7028,21 @@ local function Analyze(
             "thinking"
         )
 
-        prediction =
-            PredictEnemyReply(
-                info.position,
-                actualMove,
-                info.settings
-            )
+        if not usedEmergency
+            and info.precomputedPrediction
+            and MoveIdentity(actualMove)
+                == MoveIdentity(bestMove) then
+
+            prediction =
+                info.precomputedPrediction
+        else
+            prediction =
+                PredictEnemyReply(
+                    info.position,
+                    actualMove,
+                    info.settings
+                )
+        end
     end
 
     local text =
@@ -6202,7 +7087,11 @@ local function Analyze(
                             or "?"
                         )
                     )
-                    or Config.Mode
+                    or (
+                        Config.Mode == "Competitive"
+                        and "COMP"
+                        or Config.Mode
+                    )
             ),
             false
         )
@@ -6461,6 +7350,8 @@ task.spawn(function()
             GetCurrentMatch()
 
         if not match then
+            SetHUDSleeping(true)
+
             if LastMatchId ~= nil then
                 LastMatchId = nil
                 LastAutoRound = nil
@@ -6479,6 +7370,8 @@ task.spawn(function()
 
             continue
         end
+
+        SetHUDSleeping(false)
 
         if LastMatchId ~= match.id then
             LastMatchId = match.id
@@ -6559,10 +7452,11 @@ task.spawn(function()
 end)
 
 SetExpanded(false)
+SetHUDSleeping(true)
 SetStatus("READY", false)
 
 print(
-    "[ChessAI] Compact Sunfish v4.3 loaded (Automatic + Thinking HUD + adaptive delay)",
+    "[ChessAI] v4.9 loaded • Competitive anti-engine mode",
     "| Mode:",
     Config.Mode,
     "| Remote:",
