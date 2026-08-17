@@ -1,5 +1,5 @@
 --[[
-    Chess AI Client v6.0 - Native Neural Value Learning
+    Chess AI Client v6.0.1 - EndGame Result + Bot Live Learning Fix
     Compact dropdown GUI + Original Game Sunfish + Visual Tracer
 
     Features
@@ -2035,6 +2035,12 @@ local function LearningStartSession(
         -- used for full-ply TD transitions.
         neuralPendingState = nil,
         neuralTrajectory = {},
+
+        -- Built-in Sunfish bot fallback. Board history can skip a half-move
+        -- on some bot matches, so keep a live before/after snapshot too.
+        botTeacherPendingFEN = nil,
+        botTeacherPendingPosition = nil,
+        botLastNeuralKey = nil,
 
         resultHint = nil,
         resultReason = nil,
@@ -4999,9 +5005,13 @@ end
 LearningLoad()
 Learning.Neural.Load()
 
--- Supplement result detection with the game's EndGame event. We do not
--- assume an undocumented argument schema; only explicit result strings
--- and known table fields are interpreted.
+-- Supplement result detection with the game's EndGame event.
+--
+-- Confirmed from live logs:
+--   arg1 boolean = winning team
+--   arg2 string  = termination reason (e.g. "checkmate")
+--
+-- Explicit draw strings still take precedence over the winner-team boolean.
 do
     local endGameRemote =
         Connections:FindFirstChild(
@@ -5026,7 +5036,14 @@ do
 
                 session.endRemoteSeen = true
 
+                local args = {
+                    ...,
+                }
+
                 local tokens = {}
+                local winnerTeam = nil
+                local explicitResult = nil
+                local reasonText = nil
 
                 local function inspect(value)
                     local kind =
@@ -5040,47 +5057,62 @@ do
                             #tokens + 1
                         ] =
                             tostring(value)
+                    end
 
-                        if kind == "string" then
-                            local lower =
-                                string.lower(value)
+                    if kind == "boolean"
+                        and winnerTeam == nil then
 
-                            if value == "½-½"
-                                or lower == "1/2-1/2"
-                                or string.find(lower, "draw", 1, true)
-                                or string.find(lower, "remis", 1, true)
-                                or string.find(lower, "stalemate", 1, true)
-                                or string.find(lower, "repetition", 1, true)
-                                or string.find(lower, "fifty", 1, true) then
+                        winnerTeam = value
+                        return
+                    end
 
-                                session.resultHint = "draw"
-                                session.resultReason = value
+                    if kind == "string" then
+                        local lower =
+                            string.lower(value)
 
-                            elseif value == "1-0"
-                                and type(session.localTeam)
-                                    == "boolean" then
+                        if reasonText == nil then
+                            reasonText = value
+                        end
 
-                                session.resultHint =
-                                    session.localTeam
-                                    and "win"
-                                    or "loss"
-                                session.resultReason = value
+                        if value == "½-½"
+                            or lower == "1/2-1/2"
+                            or string.find(lower, "draw", 1, true)
+                            or string.find(lower, "remis", 1, true)
+                            or string.find(lower, "stalemate", 1, true)
+                            or string.find(lower, "repetition", 1, true)
+                            or string.find(lower, "fifty", 1, true) then
 
-                            elseif value == "0-1"
-                                and type(session.localTeam)
-                                    == "boolean" then
+                            explicitResult = "draw"
+                            reasonText = value
 
-                                session.resultHint =
-                                    not session.localTeam
-                                    and "win"
-                                    or "loss"
-                                session.resultReason = value
-                            end
+                        elseif value == "1-0"
+                            and type(session.localTeam)
+                                == "boolean" then
+
+                            explicitResult =
+                                session.localTeam
+                                and "win"
+                                or "loss"
+
+                            reasonText = value
+
+                        elseif value == "0-1"
+                            and type(session.localTeam)
+                                == "boolean" then
+
+                            explicitResult =
+                                not session.localTeam
+                                and "win"
+                                or "loss"
+
+                            reasonText = value
                         end
 
                     elseif kind == "table" then
                         for _, key in ipairs({
                             "winner",
+                            "winnerTeam",
+                            "team",
                             "result",
                             "victoryType",
                             "reason",
@@ -5093,17 +5125,55 @@ do
                     end
                 end
 
-                for _, value in ipairs({
-                    ...,
-                }) do
+                for _, value in ipairs(
+                    args
+                ) do
                     inspect(value)
                 end
 
+                if explicitResult then
+                    session.resultHint =
+                        explicitResult
+
+                elseif type(winnerTeam)
+                    == "boolean"
+                    and type(session.localTeam)
+                        == "boolean" then
+
+                    session.resultHint =
+                        winnerTeam
+                            == session.localTeam
+                        and "win"
+                        or "loss"
+                end
+
+                if reasonText then
+                    session.resultReason =
+                        reasonText
+                elseif winnerTeam ~= nil then
+                    session.resultReason =
+                        "winnerTeam="
+                        .. tostring(
+                            winnerTeam
+                        )
+                end
+
                 LearningLog(
-                    "ENDGAME_REMOTE "
-                    .. table.concat(
-                        tokens,
-                        " | "
+                    string.format(
+                        "ENDGAME_REMOTE %s => hint=%s localTeam=%s winnerTeam=%s",
+                        table.concat(
+                            tokens,
+                            " | "
+                        ),
+                        tostring(
+                            session.resultHint
+                        ),
+                        tostring(
+                            session.localTeam
+                        ),
+                        tostring(
+                            winnerTeam
+                        )
                     )
                 )
             end
@@ -5836,6 +5906,176 @@ Learning.ProcessHistory = function(match)
 
         session.resultHint = "draw"
         session.resultReason = "fiftymoves"
+    end
+end
+
+Learning.ProcessBotLiveLearning = function(match)
+    local session =
+        Learning.session
+
+    if not session
+        or session.matchId ~= match.id
+        or match.mode ~= "sunfish"
+        or type(session.localTeam) ~= "boolean" then
+
+        return
+    end
+
+    local liveFEN =
+        GetLiveFEN(match)
+
+    local activeTeam =
+        match.activeTeam
+
+    if type(activeTeam) ~= "boolean"
+        or not liveFEN then
+
+        return
+    end
+
+    if activeTeam
+        ~= session.localTeam then
+
+        -- Opponent/bot is thinking. Snapshot the exact pre-reply state.
+        if not session.botTeacherPendingFEN
+            or session.botTeacherPendingFEN
+                ~= liveFEN then
+
+            local position =
+                match.sunfishPos
+
+            if type(position) == "table"
+                and type(position.player)
+                    == "boolean"
+                and position.player
+                    == activeTeam then
+
+                session.botTeacherPendingFEN =
+                    liveFEN
+
+                session.botTeacherPendingPosition =
+                    position
+            end
+        end
+
+        return
+    end
+
+    -- We are to move again: if a bot snapshot exists, infer the reply.
+    local beforeFEN =
+        session.botTeacherPendingFEN
+
+    local beforePosition =
+        session.botTeacherPendingPosition
+
+    if beforeFEN
+        and type(beforePosition)
+            == "table"
+        and beforeFEN ~= liveFEN then
+
+        local inferred =
+            InferMoveFromFEN(
+                beforeFEN,
+                liveFEN,
+                beforePosition.player
+            )
+
+        if inferred then
+            local toMove = {
+                inferred.to[1],
+                inferred.to[2],
+            }
+
+            if inferred.promote then
+                local pieceName =
+                    PromotionNameFromFEN[
+                        inferred.promote
+                    ]
+
+                if pieceName then
+                    toMove.promote = {
+                        pieceName =
+                            pieceName,
+                    }
+                end
+            end
+
+            local sunfishMove =
+                MatchMoveToSunfish(
+                    beforePosition,
+                    inferred.from,
+                    toMove
+                )
+
+            if sunfishMove then
+                LearningRecordTeacherMove(
+                    match,
+                    beforePosition,
+                    sunfishMove
+                )
+
+                LearningLog(
+                    "BOT_TEACHER_LIVE "
+                    .. LearningMoveId(
+                        sunfishMove
+                    )
+                )
+            else
+                LearningLog(
+                    "BOT_TEACHER_LIVE_FAIL map"
+                )
+            end
+        else
+            LearningLog(
+                "BOT_TEACHER_LIVE_FAIL diff"
+            )
+        end
+
+        session.botTeacherPendingFEN =
+            nil
+
+        session.botTeacherPendingPosition =
+            nil
+    end
+
+    -- Feed a stable OUR-turn position into the neural full-ply trajectory.
+    if Config.NeuralEnabled
+        and type(
+            Learning.Neural
+        ) == "table"
+        and type(
+            Learning.Neural.ExtractFeatures
+        ) == "function"
+        and type(match.sunfishPos)
+            == "table"
+        and match.sunfishPos.player
+            == session.localTeam then
+
+        local positionKey =
+            LearningPositionKey(
+                match.sunfishPos
+            )
+
+        if positionKey
+            and positionKey
+                ~= session.botLastNeuralKey then
+
+            local features =
+                Learning.Neural.ExtractFeatures(
+                    match.sunfishPos,
+                    session.localTeam
+                )
+
+            if features then
+                session.botLastNeuralKey =
+                    positionKey
+
+                Learning.Neural.RecordOwnTurnState(
+                    session,
+                    features
+                )
+            end
+        end
     end
 end
 
@@ -12453,6 +12693,16 @@ task.spawn(function()
             )
         end
 
+        if type(
+            Learning.ProcessBotLiveLearning
+        ) == "function" then
+
+            pcall(
+                Learning.ProcessBotLiveLearning,
+                match
+            )
+        end
+
         if not Config.AutoMove
             or Config._Runtime.Thinking then
 
@@ -12523,7 +12773,7 @@ SetHUDSleeping(true)
 SetStatus("READY", false)
 
 print(
-    "[ChessAI] v6.0 loaded • Native Neural Value Network",
+    "[ChessAI] v6.0.1 loaded • Result + Bot Teacher/Neural fix",
     "| Mode:",
     Config.Mode,
     "| Memory:",
