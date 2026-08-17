@@ -1,5 +1,5 @@
 --[[
-    Chess AI Client v5.0.1 - Workspace Memory Storage
+    Chess AI Client v5.0.2 - Luau Register Fix
     Compact dropdown GUI + Original Game Sunfish + Visual Tracer
 
     Features
@@ -8,7 +8,7 @@
     * Compact collapsible GUI
     * Difficulty profiles based on the game's own bot settings
     * Automatic adaptive mode: Easy/Normal/Hard/Nightmare escalation + committee
-    * Vietnamese Thinking HUD generated from observable engine telemetry
+    * Vietnamese Config._Runtime.Thinking HUD generated from observable engine telemetry
     * Complexity-aware randomized human-like move delay
     * Analyze / Recommend mode (no automatic move)
     * Optional AutoMove
@@ -354,6 +354,18 @@ local function MakeProfiles()
         Competitive = competitive,
     }
 end
+
+-- Runtime state is kept inside Config to avoid exhausting Luau's
+-- top-level 200-local-register limit as this script grows.
+Config._Runtime = {
+    Dragging = false,
+    DragStart = nil,
+    MainStart = nil,
+
+    Thinking = false,
+    LastAutoRound = nil,
+    LastMatchId = nil,
+}
 
 local Profiles = MakeProfiles()
 
@@ -8524,7 +8536,7 @@ NewToggleRow(
 
 NewToggleRow(
     218,
-    "HUD • Thinking",
+    "HUD • Config._Runtime.Thinking",
     Config.ShowThinkingHUD,
     function(v)
         Config.ShowThinkingHUD = v
@@ -8663,9 +8675,6 @@ Header.MouseButton1Click:Connect(
 )
 
 -- Drag from header.
-local Dragging = false
-local DragStart
-local MainStart
 
 Header.InputBegan:Connect(
     function(input)
@@ -8674,16 +8683,16 @@ Header.InputBegan:Connect(
             or input.UserInputType
                 == Enum.UserInputType.Touch then
 
-            Dragging = true
-            DragStart = input.Position
-            MainStart = Main.Position
+            Config._Runtime.Dragging = true
+            Config._Runtime.DragStart = input.Position
+            Config._Runtime.MainStart = Main.Position
         end
     end
 )
 
 UserInputService.InputChanged:Connect(
     function(input)
-        if not Dragging then
+        if not Config._Runtime.Dragging then
             return
         end
 
@@ -8693,16 +8702,16 @@ UserInputService.InputChanged:Connect(
                 == Enum.UserInputType.Touch then
 
             local delta =
-                input.Position - DragStart
+                input.Position - Config._Runtime.DragStart
 
             Main.Position =
                 UDim2.new(
-                    MainStart.X.Scale,
-                    MainStart.X.Offset
+                    Config._Runtime.MainStart.X.Scale,
+                    Config._Runtime.MainStart.X.Offset
                         + delta.X,
 
-                    MainStart.Y.Scale,
-                    MainStart.Y.Offset
+                    Config._Runtime.MainStart.Y.Scale,
+                    Config._Runtime.MainStart.Y.Offset
                         + delta.Y
                 )
         end
@@ -8716,7 +8725,7 @@ UserInputService.InputEnded:Connect(
             or input.UserInputType
                 == Enum.UserInputType.Touch then
 
-            Dragging = false
+            Config._Runtime.Dragging = false
         end
     end
 )
@@ -8725,9 +8734,6 @@ UserInputService.InputEnded:Connect(
 --// ANALYZE / AUTOMOVE
 --// ============================================================
 
-local Thinking = false
-local LastAutoRound = nil
-local LastMatchId = nil
 
 BoardMoveText = function(move, position)
     local converted =
@@ -8777,7 +8783,7 @@ end
 local function Analyze(
     autoSend
 )
-    if Thinking then
+    if Config._Runtime.Thinking then
         return false
     end
 
@@ -8819,7 +8825,7 @@ local function Analyze(
         return false
     end
 
-    Thinking = true
+    Config._Runtime.Thinking = true
 
     SetStatus(
         "THINKING • "
@@ -8836,7 +8842,7 @@ local function Analyze(
         )
 
     if not ok then
-        Thinking = false
+        Config._Runtime.Thinking = false
 
         local crashText =
             "SEARCH CRASH: "
@@ -8856,7 +8862,7 @@ local function Analyze(
     end
 
     if not bestMove then
-        Thinking = false
+        Config._Runtime.Thinking = false
 
         local searchError =
             info
@@ -8894,7 +8900,7 @@ local function Analyze(
     if not actualMove
         or not resolved then
 
-        Thinking = false
+        Config._Runtime.Thinking = false
 
         SetStatus(
             originalResolveError
@@ -9019,7 +9025,7 @@ local function Analyze(
     end
 
     if not autoSend then
-        Thinking = false
+        Config._Runtime.Thinking = false
         return true
     end
 
@@ -9068,7 +9074,7 @@ local function Analyze(
         or liveMatch.id ~= match.id
         or liveMatch.activeTeam ~= localTeam then
 
-        Thinking = false
+        Config._Runtime.Thinking = false
         return false
     end
 
@@ -9076,7 +9082,7 @@ local function Analyze(
         FindMatchClient()
 
     if not liveClient then
-        Thinking = false
+        Config._Runtime.Thinking = false
 
         SetStatus(
             "MATCHCLIENT LOST",
@@ -9136,7 +9142,7 @@ local function Analyze(
                 true
             )
         else
-            Thinking = false
+            Config._Runtime.Thinking = false
 
             SetStatus(
                 liveResolveError
@@ -9154,7 +9160,7 @@ local function Analyze(
     if not sourcePiece
         or sourcePiece.team ~= localTeam then
 
-        Thinking = false
+        Config._Runtime.Thinking = false
 
         SetStatus(
             "ORIENTATION GUARD BLOCKED",
@@ -9187,7 +9193,7 @@ local function Analyze(
             true
         )
 
-        Thinking = false
+        Config._Runtime.Thinking = false
         return false
     end
 
@@ -9229,7 +9235,7 @@ local function Analyze(
                 true
             )
 
-            Thinking = false
+            Config._Runtime.Thinking = false
             return false
         end
     end
@@ -9254,7 +9260,7 @@ local function Analyze(
         "decision"
     )
 
-    Thinking = false
+    Config._Runtime.Thinking = false
     return true
 end
 
@@ -9286,18 +9292,18 @@ task.spawn(function()
         if not match then
             SetHUDSleeping(true)
 
-            if LastMatchId ~= nil then
+            if Config._Runtime.LastMatchId ~= nil then
                 LearningPollResult()
 
-                LastMatchId = nil
-                LastAutoRound = nil
+                Config._Runtime.LastMatchId = nil
+                Config._Runtime.LastAutoRound = nil
                 ResetShadow(nil)
                 ClearVisuals()
                 ResetAnalysisHUD()
                 UpdatePieceHUD(nil, nil)
             end
 
-            if not Thinking then
+            if not Config._Runtime.Thinking then
                 SetStatus(
                     "WAITING FOR MATCH",
                     false
@@ -9309,9 +9315,9 @@ task.spawn(function()
 
         SetHUDSleeping(false)
 
-        if LastMatchId ~= match.id then
-            LastMatchId = match.id
-            LastAutoRound = nil
+        if Config._Runtime.LastMatchId ~= match.id then
+            Config._Runtime.LastMatchId = match.id
+            Config._Runtime.LastAutoRound = nil
             ResetShadow(match)
             ResetAnalysisHUD()
             LearningStartSession(match)
@@ -9324,7 +9330,7 @@ task.spawn(function()
         end
 
         if not Config.AutoMove
-            or Thinking then
+            or Config._Runtime.Thinking then
 
             continue
         end
@@ -9342,7 +9348,7 @@ task.spawn(function()
         )
 
         if match.activeTeam ~= localTeam then
-            if not Thinking then
+            if not Config._Runtime.Thinking then
                 SetStatus(
                     "OPPONENT TURN",
                     false
@@ -9359,11 +9365,11 @@ task.spawn(function()
             .. ":"
             .. tostring(match.activeTeam)
 
-        if LastAutoRound == roundKey then
+        if Config._Runtime.LastAutoRound == roundKey then
             continue
         end
 
-        LastAutoRound = roundKey
+        Config._Runtime.LastAutoRound = roundKey
 
         task.spawn(
             function()
@@ -9375,10 +9381,10 @@ task.spawn(function()
                     task.delay(
                         0.8,
                         function()
-                            if LastAutoRound
+                            if Config._Runtime.LastAutoRound
                                 == roundKey then
 
-                                LastAutoRound = nil
+                                Config._Runtime.LastAutoRound = nil
                             end
                         end
                     )
@@ -9393,7 +9399,7 @@ SetHUDSleeping(true)
 SetStatus("READY", false)
 
 print(
-    "[ChessAI] v5.0.1 loaded • Workspace Memory Storage",
+    "[ChessAI] v5.0.2 loaded • Luau register fix + workspace memory",
     "| Mode:",
     Config.Mode,
     "| Memory:",
