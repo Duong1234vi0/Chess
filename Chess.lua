@@ -1,5 +1,5 @@
 --[[
-    Chess AI Client v5.0.2 - Luau Register Fix
+    Chess AI Client v5.1 - Draw Result + Teacher Replay + Repetition Learning
     Compact dropdown GUI + Original Game Sunfish + Visual Tracer
 
     Features
@@ -150,6 +150,13 @@ local Config = {
     LearningMaxPositions = 5000,
     LearningSaveInterval = 8.0,
     LearningMoveBiasMax = 180,
+
+    -- Draw/repetition learning.
+    LearningRepetitionAvoidEval = 300,
+    LearningRepetitionHardPenalty = 50000,
+    LearningDrawWinningPenalty = 0.32,
+    LearningDrawLosingReward = 0.22,
+    LearningRepetitionRecentPenalty = 0.95,
 
     -- Enemy reply search uses a fraction of the selected mode's nodes
     -- so Nightmare does not perform two full 65k-node searches every turn.
@@ -1179,14 +1186,14 @@ end
 EnsureLearningWorkspace()
 
 local Learning = {
-    version = 1,
+    version = 2,
     loaded = false,
     persistent = false,
     dirty = false,
     lastSave = 0,
 
     data = {
-        version = 1,
+        version = 2,
 
         games = {
             played = 0,
@@ -1329,8 +1336,11 @@ local function LearningEnsureData(data)
     end
 
     data.version =
-        tonumber(data.version)
-        or 1
+        math.max(
+            tonumber(data.version)
+                or 1,
+            2
+        )
 
     data.games =
         type(data.games) == "table"
@@ -1938,6 +1948,22 @@ local function LearningStartSession(
         decisions = {},
         teacherEvents = {},
         seenTeacherEvents = {},
+
+        positionVisits = {},
+        sunfishVisits = {},
+
+        historyIndex = 0,
+        historyPosition = nil,
+        historyFirstFEN = nil,
+
+        repetitionCounts = {},
+        repetitionDraw = false,
+        repetitionKey = nil,
+
+        resultHint = nil,
+        resultReason = nil,
+        endRemoteSeen = false,
+
         finalized = false,
         endDetectedAt = nil,
     }
@@ -2031,6 +2057,24 @@ local function LearningRecordOwnMove(
         (tonumber(bucket.seen) or 0)
         + 1
 
+    session.positionVisits[
+        positionKey
+    ] =
+        (
+            tonumber(
+                session.positionVisits[
+                    positionKey
+                ]
+            )
+            or 0
+        )
+        + 1
+
+    local positionVisit =
+        session.positionVisits[
+            positionKey
+        ]
+
     session.decisions[
         #session.decisions + 1
     ] = {
@@ -2048,6 +2092,9 @@ local function LearningRecordOwnMove(
                 and info.score
             )
             or 0,
+
+        positionVisit =
+            positionVisit,
     }
 
     Learning.dirty = true
@@ -2179,6 +2226,25 @@ local function LearningResolveResult(
 
     local winner =
         match.winner
+
+    local victoryType =
+        match.victoryType
+
+    if type(victoryType) == "string" then
+        local lowerVictory =
+            string.lower(
+                victoryType
+            )
+
+        if string.find(lowerVictory, "repetition", 1, true)
+            or string.find(lowerVictory, "fifty", 1, true)
+            or string.find(lowerVictory, "stalemate", 1, true)
+            or string.find(lowerVictory, "draw", 1, true)
+            or string.find(lowerVictory, "remis", 1, true) then
+
+            return "draw"
+        end
+    end
 
     if winner == nil
         or winner == "-"
@@ -2321,6 +2387,13 @@ local function LearningFinalizeSession(
         result
         or "unknown"
 
+    reason =
+        tostring(
+            reason
+            or session.resultReason
+            or "?"
+        )
+
     local games =
         Learning.data.games
 
@@ -2349,17 +2422,24 @@ local function LearningFinalizeSession(
             + 1
     end
 
-    local outcome =
-        result == "win"
-            and 1
-        or result == "loss"
-            and -1
-        or result == "draw"
-            and 0.15
-        or 0
+    local isRepetition =
+        result == "draw"
+        and (
+            session.repetitionDraw
+            or string.find(
+                string.lower(reason),
+                "repetition",
+                1,
+                true
+            ) ~= nil
+        )
 
     local decisionCount =
         #session.decisions
+
+    -- W/D/L counters are once-per-game per (position,move), while
+    -- experience remains occurrence-sensitive.
+    local creditedOwn = {}
 
     for index, decision in ipairs(
         session.decisions
@@ -2373,10 +2453,8 @@ local function LearningFinalizeSession(
 
         if entry then
             local distance =
-                decisionCount
-                - index
+                decisionCount - index
 
-            -- Recent decisions get more blame/reward.
             local credit =
                 0.28
                 + 0.72
@@ -2384,30 +2462,99 @@ local function LearningFinalizeSession(
                         -distance / 6
                     )
 
+            local statKey =
+                tostring(decision.positionKey)
+                .. ">"
+                .. tostring(decision.moveId)
+
+            if not creditedOwn[statKey] then
+                creditedOwn[statKey] = true
+
+                if result == "win" then
+                    entry.wins =
+                        (tonumber(entry.wins) or 0)
+                        + 1
+
+                elseif result == "loss" then
+                    entry.losses =
+                        (tonumber(entry.losses) or 0)
+                        + 1
+
+                elseif result == "draw" then
+                    entry.draws =
+                        (tonumber(entry.draws) or 0)
+                        + 1
+                end
+            end
+
+            local delta = 0
+
             if result == "win" then
-                entry.wins =
-                    (tonumber(entry.wins) or 0)
-                    + 1
+                delta = credit
 
             elseif result == "loss" then
-                entry.losses =
-                    (tonumber(entry.losses) or 0)
-                    + 1
+                delta = -credit
 
             elseif result == "draw" then
-                entry.draws =
-                    (tonumber(entry.draws) or 0)
-                    + 1
+                local eval =
+                    tonumber(decision.eval)
+                    or 0
+
+                -- A draw from a losing position is useful.
+                -- A draw from a clearly winning position is a failure.
+                if eval <= -Config.LearningRepetitionAvoidEval then
+                    delta =
+                        Config.LearningDrawLosingReward
+                        * credit
+
+                elseif eval >= Config.LearningRepetitionAvoidEval then
+                    delta =
+                        -Config.LearningDrawWinningPenalty
+                        * credit
+                else
+                    delta =
+                        0.02 * credit
+                end
+
+                if isRepetition then
+                    local recent =
+                        distance <= 6
+
+                    local repeatedDecision =
+                        (
+                            tonumber(
+                                decision.positionVisit
+                            )
+                            or 0
+                        ) >= 2
+
+                    if recent
+                        or repeatedDecision then
+
+                        delta -=
+                            Config.LearningRepetitionRecentPenalty
+                            * credit
+
+                        entry.repetitionDraws =
+                            (
+                                tonumber(entry.repetitionDraws)
+                                or 0
+                            )
+                            + 1
+                    end
+                end
             end
 
             entry.experience =
                 (tonumber(entry.experience) or 0)
-                + outcome * credit
+                + delta
         end
     end
 
     local teacherCount =
         #session.teacherEvents
+
+    local creditedTeacher = {}
 
     for index, event in ipairs(
         session.teacherEvents
@@ -2421,8 +2568,7 @@ local function LearningFinalizeSession(
 
         if entry then
             local distance =
-                teacherCount
-                - index
+                teacherCount - index
 
             local credit =
                 0.30
@@ -2431,20 +2577,37 @@ local function LearningFinalizeSession(
                         -distance / 5
                     )
 
-            if result == "loss" then
-                entry.losses =
-                    (tonumber(entry.losses) or 0)
-                    + 1
+            local statKey =
+                tostring(event.positionKey)
+                .. ">"
+                .. tostring(event.moveId)
 
+            if not creditedTeacher[statKey] then
+                creditedTeacher[statKey] = true
+
+                if result == "loss" then
+                    entry.losses =
+                        (tonumber(entry.losses) or 0)
+                        + 1
+
+                elseif result == "win" then
+                    entry.wins =
+                        (tonumber(entry.wins) or 0)
+                        + 1
+
+                elseif result == "draw" then
+                    entry.draws =
+                        (tonumber(entry.draws) or 0)
+                        + 1
+                end
+            end
+
+            if result == "loss" then
                 entry.punish =
                     (tonumber(entry.punish) or 0)
                     + credit
 
             elseif result == "win" then
-                entry.wins =
-                    (tonumber(entry.wins) or 0)
-                    + 1
-
                 entry.punish =
                     math.max(
                         0,
@@ -2453,13 +2616,14 @@ local function LearningFinalizeSession(
                     )
 
             elseif result == "draw" then
-                entry.draws =
-                    (tonumber(entry.draws) or 0)
-                    + 1
-
                 entry.punish =
                     (tonumber(entry.punish) or 0)
-                    + 0.08 * credit
+                    + (
+                        isRepetition
+                        and 0.04
+                        or 0.08
+                    )
+                        * credit
             end
         end
     end
@@ -2468,15 +2632,18 @@ local function LearningFinalizeSession(
 
     LearningLog(
         string.format(
-            "MATCH_RESULT id=%s result=%s reason=%s decisions=%d teacher=%d | W/D/L=%d/%d/%d",
+            "MATCH_RESULT id=%s result=%s reason=%s decisions=%d teacher=%d | W/D/L=%d/%d/%d%s",
             tostring(session.matchId),
             tostring(result),
-            tostring(reason or "?"),
+            tostring(reason),
             decisionCount,
             teacherCount,
             games.wins or 0,
             games.draws or 0,
-            games.losses or 0
+            games.losses or 0,
+            isRepetition
+                and " • REPETITION_LEARNED"
+                or ""
         )
     )
 
@@ -2497,37 +2664,196 @@ local function LearningPollResult()
     local match =
         session.matchRef
 
-    if type(match) == "table"
-        and match.gameEnded == true then
+    if type(
+        Learning.ProcessHistory
+    ) == "function"
+        and type(match) == "table" then
 
-        local result =
-            LearningResolveResult(
-                match,
-                session.localTeam
-            )
-
-        if result == "unknown" then
-            session.endDetectedAt =
-                session.endDetectedAt
-                or os.clock()
-
-            -- Winner may update a fraction later than gameEnded.
-            if os.clock()
-                - session.endDetectedAt
-                < 1.25 then
-
-                return
-            end
-        end
-
-        LearningFinalizeSession(
-            result,
-            "gameEnded"
+        pcall(
+            Learning.ProcessHistory,
+            match
         )
     end
+
+    local ended =
+        type(match) == "table"
+        and match.gameEnded == true
+
+    if not ended
+        and not session.endRemoteSeen then
+
+        return
+    end
+
+    local result =
+        LearningResolveResult(
+            match,
+            session.localTeam
+        )
+
+    local reason =
+        session.resultReason
+        or "gameEnded"
+
+    if result == "unknown"
+        and session.resultHint then
+
+        result =
+            session.resultHint
+    end
+
+    if result == "unknown"
+        and session.repetitionDraw then
+
+        result = "draw"
+        reason = "repetition"
+    end
+
+    if result == "unknown"
+        and type(match) == "table"
+        and (
+            tonumber(
+                match.fiftyMoveCounter
+            )
+            or 0
+        ) >= 100 then
+
+        result = "draw"
+        reason = "fiftymoves"
+    end
+
+    if result == "unknown" then
+        session.endDetectedAt =
+            session.endDetectedAt
+            or os.clock()
+
+        if os.clock()
+            - session.endDetectedAt
+            < 1.50 then
+
+            return
+        end
+    end
+
+    LearningFinalizeSession(
+        result,
+        reason
+    )
 end
 
 LearningLoad()
+
+-- Supplement result detection with the game's EndGame event. We do not
+-- assume an undocumented argument schema; only explicit result strings
+-- and known table fields are interpreted.
+do
+    local endGameRemote =
+        Connections:FindFirstChild(
+            "EndGame"
+        )
+
+    if endGameRemote
+        and endGameRemote:IsA(
+            "RemoteEvent"
+        ) then
+
+        endGameRemote.OnClientEvent:Connect(
+            function(...)
+                local session =
+                    Learning.session
+
+                if not session
+                    or session.finalized then
+
+                    return
+                end
+
+                session.endRemoteSeen = true
+
+                local tokens = {}
+
+                local function inspect(value)
+                    local kind =
+                        typeof(value)
+
+                    if kind == "string"
+                        or kind == "number"
+                        or kind == "boolean" then
+
+                        tokens[
+                            #tokens + 1
+                        ] =
+                            tostring(value)
+
+                        if kind == "string" then
+                            local lower =
+                                string.lower(value)
+
+                            if value == "½-½"
+                                or lower == "1/2-1/2"
+                                or string.find(lower, "draw", 1, true)
+                                or string.find(lower, "remis", 1, true)
+                                or string.find(lower, "stalemate", 1, true)
+                                or string.find(lower, "repetition", 1, true)
+                                or string.find(lower, "fifty", 1, true) then
+
+                                session.resultHint = "draw"
+                                session.resultReason = value
+
+                            elseif value == "1-0"
+                                and type(session.localTeam)
+                                    == "boolean" then
+
+                                session.resultHint =
+                                    session.localTeam
+                                    and "win"
+                                    or "loss"
+                                session.resultReason = value
+
+                            elseif value == "0-1"
+                                and type(session.localTeam)
+                                    == "boolean" then
+
+                                session.resultHint =
+                                    not session.localTeam
+                                    and "win"
+                                    or "loss"
+                                session.resultReason = value
+                            end
+                        end
+
+                    elseif kind == "table" then
+                        for _, key in ipairs({
+                            "winner",
+                            "result",
+                            "victoryType",
+                            "reason",
+                            "termination",
+                        }) do
+                            if value[key] ~= nil then
+                                inspect(value[key])
+                            end
+                        end
+                    end
+                end
+
+                for _, value in ipairs({
+                    ...,
+                }) do
+                    inspect(value)
+                end
+
+                LearningLog(
+                    "ENDGAME_REMOTE "
+                    .. table.concat(
+                        tokens,
+                        " | "
+                    )
+                )
+            end
+        )
+    end
+end
 
 --// ============================================================
 --// v4.8 MIDGAME FEN/HISTORY REPLAY
@@ -2965,6 +3291,376 @@ local function CollectFENHistory(match)
     )
 
     return history
+end
+
+
+--// ============================================================
+--// v5.1 LEARNING FROM BOARD HISTORY
+--// ============================================================
+
+Learning.CanonicalRepetitionFEN = function(fen)
+    if not IsFENString(fen) then
+        return nil
+    end
+
+    local fields = {}
+
+    for word in string.gmatch(
+        fen,
+        "%S+"
+    ) do
+        fields[#fields + 1] = word
+    end
+
+    if #fields < 1 then
+        return nil
+    end
+
+    return table.concat({
+        fields[1] or "",
+        fields[2] or "",
+        fields[3] or "-",
+        fields[4] or "-",
+    }, " ")
+end
+
+Learning.ProcessHistory = function(match)
+    local session =
+        Learning.session
+
+    if not session
+        or session.matchId
+            ~= match.id then
+
+        return
+    end
+
+    local history =
+        CollectFENHistory(match)
+
+    if #history < 1 then
+        return
+    end
+
+    if session.historyIndex <= 0
+        or session.historyFirstFEN
+            ~= history[1]
+        or type(session.historyPosition)
+            ~= "table" then
+
+        local first =
+            ParseFEN(history[1])
+
+        if not first
+            or first.placement
+                ~= "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR" then
+
+            return
+        end
+
+        local okCreate, position =
+            pcall(
+                Sunfish.createPosition,
+                Sunfish.initial
+            )
+
+        if not okCreate
+            or type(position) ~= "table" then
+
+            return
+        end
+
+        session.historyIndex = 1
+        session.historyFirstFEN = history[1]
+        session.historyPosition = position
+
+        session.repetitionCounts = {}
+        session.sunfishVisits = {}
+
+        local firstKey =
+            Learning.CanonicalRepetitionFEN(
+                history[1]
+            )
+
+        if firstKey then
+            session.repetitionCounts[firstKey] = 1
+        end
+
+        local sunfishKey =
+            LearningPositionKey(position)
+
+        if sunfishKey then
+            session.sunfishVisits[sunfishKey] = 1
+        end
+    end
+
+    if #history < session.historyIndex then
+        session.historyIndex = 0
+        session.historyPosition = nil
+        return
+    end
+
+    local position =
+        session.historyPosition
+
+    for index =
+        session.historyIndex + 1,
+        #history do
+
+        local beforeFEN =
+            history[index - 1]
+
+        local afterFEN =
+            history[index]
+
+        local inferred =
+            InferMoveFromFEN(
+                beforeFEN,
+                afterFEN,
+                position.player
+            )
+
+        if not inferred then
+            break
+        end
+
+        local toMove = {
+            inferred.to[1],
+            inferred.to[2],
+        }
+
+        if inferred.promote then
+            local pieceName =
+                PromotionNameFromFEN[
+                    inferred.promote
+                ]
+
+            if pieceName then
+                toMove.promote = {
+                    pieceName = pieceName,
+                }
+            end
+        end
+
+        local sunfishMove =
+            MatchMoveToSunfish(
+                position,
+                inferred.from,
+                toMove
+            )
+
+        if not sunfishMove then
+            break
+        end
+
+        if type(session.localTeam) == "boolean"
+            and position.player
+                ~= session.localTeam then
+
+            -- Works for PvP AND built-in Sunfish bot games.
+            LearningRecordTeacherMove(
+                match,
+                position,
+                sunfishMove
+            )
+        end
+
+        local okMove, nextPosition =
+            pcall(function()
+                return position:move(
+                    sunfishMove
+                )
+            end)
+
+        if not okMove
+            or type(nextPosition) ~= "table" then
+
+            break
+        end
+
+        position = nextPosition
+        session.historyPosition = position
+        session.historyIndex = index
+
+        local repetitionKey =
+            Learning.CanonicalRepetitionFEN(
+                afterFEN
+            )
+
+        if repetitionKey then
+            local count =
+                (
+                    tonumber(
+                        session.repetitionCounts[
+                            repetitionKey
+                        ]
+                    )
+                    or 0
+                )
+                + 1
+
+            session.repetitionCounts[
+                repetitionKey
+            ] = count
+
+            if count >= 3 then
+                session.repetitionDraw = true
+                session.repetitionKey = repetitionKey
+                session.resultHint = "draw"
+                session.resultReason = "repetition"
+            end
+        end
+
+        local sunfishKey =
+            LearningPositionKey(position)
+
+        if sunfishKey then
+            session.sunfishVisits[
+                sunfishKey
+            ] =
+                (
+                    tonumber(
+                        session.sunfishVisits[
+                            sunfishKey
+                        ]
+                    )
+                    or 0
+                )
+                + 1
+        end
+    end
+
+    if (
+        tonumber(match.fiftyMoveCounter)
+        or 0
+    ) >= 100 then
+
+        session.resultHint = "draw"
+        session.resultReason = "fiftymoves"
+    end
+end
+
+Learning.RepetitionRisk = function(
+    position,
+    move
+)
+    local session =
+        Learning.session
+
+    if not session
+        or type(position) ~= "table"
+        or type(move) ~= "table" then
+
+        return 0
+    end
+
+    local okNext, nextPosition =
+        pcall(function()
+            return position:move(move)
+        end)
+
+    if not okNext
+        or type(nextPosition) ~= "table" then
+
+        return 0
+    end
+
+    local key =
+        LearningPositionKey(nextPosition)
+
+    if not key then
+        return 0
+    end
+
+    return tonumber(
+        session.sunfishVisits[key]
+    ) or 0
+end
+
+Learning.ApplyRepetitionGuard = function(
+    match,
+    position,
+    selectedMove,
+    info
+)
+    if not Config.LearningEnabled
+        or type(selectedMove) ~= "table"
+        or type(position) ~= "table" then
+
+        return selectedMove, info
+    end
+
+    local risk =
+        Learning.RepetitionRisk(
+            position,
+            selectedMove
+        )
+
+    if risk < 2 then
+        return selectedMove, info
+    end
+
+    local score =
+        tonumber(
+            info
+            and info.score
+        )
+        or 0
+
+    -- When clearly losing, repetition is allowed as a defensive resource.
+    if score
+        <= -Config.LearningRepetitionAvoidEval then
+
+        return selectedMove, info
+    end
+
+    local candidates =
+        info
+        and info.candidates
+
+    if type(candidates) == "table" then
+        local team =
+            GetLocalTeam(match)
+
+        for _, candidate in ipairs(candidates) do
+            local move =
+                candidate.move
+
+            if type(move) == "table"
+                and MoveIdentity(move)
+                    ~= MoveIdentity(selectedMove)
+                and Learning.RepetitionRisk(
+                    position,
+                    move
+                ) < 2
+                and ResolveGameMove(
+                    match,
+                    move,
+                    position,
+                    team
+                ) then
+
+                LearningLog(
+                    string.format(
+                        "REPETITION_VETO id=%s old=%s new=%s eval=%+.2f",
+                        tostring(match.id),
+                        LearningMoveId(selectedMove),
+                        LearningMoveId(move),
+                        score / 100
+                    )
+                )
+
+                SetThinkingNarrative(
+                    "Learning Memory: bác nước dẫn tới lặp lần 3 khi đang không thua.",
+                    "warning"
+                )
+
+                return move, info
+            end
+        end
+    end
+
+    return selectedMove, info
 end
 
 local function StandardInitialPlacement()
@@ -5548,6 +6244,28 @@ local function AddCompetitiveCandidate(
             move
         )
 
+    local repetitionRisk =
+        type(
+            Learning.RepetitionRisk
+        ) == "function"
+        and Learning.RepetitionRisk(
+            position,
+            move
+        )
+        or 0
+
+    local repetitionPenalty = 0
+
+    if repetitionRisk >= 2
+        and (
+            tonumber(ownScore)
+            or 0
+        ) > -Config.LearningRepetitionAvoidEval then
+
+        repetitionPenalty =
+            Config.LearningRepetitionHardPenalty
+    end
+
     pool[#pool + 1] = {
         move = move,
 
@@ -5556,7 +6274,11 @@ local function AddCompetitiveCandidate(
                 tonumber(ownScore)
                 or -90000
             )
-            + memoryBias,
+            + memoryBias
+            - repetitionPenalty,
+
+        repetitionRisk =
+            repetitionRisk,
 
         rawScore =
             tonumber(ownScore)
@@ -6204,6 +6926,20 @@ local function SearchBestMove(match)
             ),
             "decision"
         )
+    end
+
+    if bestMove
+        and type(
+            Learning.ApplyRepetitionGuard
+        ) == "function" then
+
+        bestMove, info =
+            Learning.ApplyRepetitionGuard(
+                match,
+                position,
+                bestMove,
+                info
+            )
     end
 
     return bestMove, info
@@ -9329,6 +10065,16 @@ task.spawn(function()
             )
         end
 
+        if type(
+            Learning.ProcessHistory
+        ) == "function" then
+
+            pcall(
+                Learning.ProcessHistory,
+                match
+            )
+        end
+
         if not Config.AutoMove
             or Config._Runtime.Thinking then
 
@@ -9399,7 +10145,7 @@ SetHUDSleeping(true)
 SetStatus("READY", false)
 
 print(
-    "[ChessAI] v5.0.2 loaded • Luau register fix + workspace memory",
+    "[ChessAI] v5.1 loaded • Draw/Teacher/Repetition learning",
     "| Mode:",
     Config.Mode,
     "| Memory:",
