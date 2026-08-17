@@ -1,5 +1,5 @@
 --[[
-    Chess AI Client v4.9 - Competitive Anti-Engine
+    Chess AI Client v5.0.1 - Workspace Memory Storage
     Compact dropdown GUI + Original Game Sunfish + Visual Tracer
 
     Features
@@ -42,6 +42,7 @@ local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
+local HttpService = game:GetService("HttpService")
 local Workspace = game:GetService("Workspace")
 
 local LocalPlayer = Players.LocalPlayer
@@ -112,14 +113,43 @@ local Config = {
     AutomaticDefenseShortlist = 6,
 
     -- Competitive / anti-engine mode.
-    -- This is intentionally much heavier than Automatic.
-    CompetitiveRootNodes = 120000,
-    CompetitiveProbeNodes = 35000,
-    CompetitiveDeepProbeNodes = 90000,
-    CompetitiveRecoveryNodes = 45000,
-    CompetitiveCandidateLimit = 4,
-    CompetitiveFinalists = 2,
-    CompetitiveMinDepth = 16,
+    --
+    -- v4.9 could request >500k nodes in one move. On a 10-minute
+    -- mobile game that can lose on clock even with a good position.
+    --
+    -- v5.0 uses a much smaller base budget + stage deadline.
+    CompetitiveRootNodes = 22000,
+    CompetitiveProbeNodes = 4500,
+    CompetitiveDeepProbeNodes = 9000,
+    CompetitiveRecoveryNodes = 4000,
+    CompetitiveCandidateLimit = 3,
+    CompetitiveFinalists = 1,
+    CompetitiveMinDepth = 9,
+
+    -- Soft wall-clock target. A search already running cannot return
+    -- partial results cleanly, but new expensive stages are not started
+    -- after this deadline.
+    CompetitiveThinkTarget = 5.5,
+
+    -- Clock-aware scaling.
+    CompetitiveLowTimeSeconds = 120,
+    CompetitiveCriticalTimeSeconds = 45,
+    CompetitivePanicTimeSeconds = 20,
+
+    -- Learning / Teacher Memory.
+    LearningEnabled = true,
+    LearningPersistent = true,
+
+    -- Executor workspace storage.
+    -- Delta maps this relative folder to:
+    -- /storage/emulated/0/Delta/Workspace/ChessAI/
+    LearningFolder = "ChessAI",
+    LearningMemoryName = "LearningMemory_v1.json",
+    LearningLogName = "LearningLog.txt",
+
+    LearningMaxPositions = 5000,
+    LearningSaveInterval = 8.0,
+    LearningMoveBiasMax = 180,
 
     -- Enemy reply search uses a fraction of the selected mode's nodes
     -- so Nightmare does not perform two full 65k-node searches every turn.
@@ -1049,6 +1079,1443 @@ local function MoveKey(fromPos, toPos)
     }, ":")
 end
 
+
+
+--// ============================================================
+--// LEARNING MEMORY / TEACHER MEMORY
+--// ============================================================
+
+local function JoinWorkspacePath(folder, name)
+    folder = tostring(folder or "")
+    name = tostring(name or "")
+
+    if folder == "" then
+        return name
+    end
+
+    folder = string.gsub(folder, "[/\\]+$", "")
+
+    return folder .. "/" .. name
+end
+
+local LearningStorage = {
+    folder = Config.LearningFolder,
+
+    memoryPath =
+        JoinWorkspacePath(
+            Config.LearningFolder,
+            Config.LearningMemoryName
+        ),
+
+    logPath =
+        JoinWorkspacePath(
+            Config.LearningFolder,
+            Config.LearningLogName
+        ),
+
+    folderReady = false,
+}
+
+local function EnsureLearningWorkspace()
+    local folder = LearningStorage.folder
+
+    if type(folder) ~= "string"
+        or folder == "" then
+
+        LearningStorage.folderReady = true
+        return true
+    end
+
+    -- Executor file APIs are normally relative to their workspace root.
+    -- On Delta this becomes:
+    -- /storage/emulated/0/Delta/Workspace/ChessAI/...
+    if type(isfolder) == "function" then
+        local okCheck, exists =
+            pcall(
+                isfolder,
+                folder
+            )
+
+        if okCheck and exists then
+            LearningStorage.folderReady = true
+            return true
+        end
+    end
+
+    if type(makefolder) == "function" then
+        local okCreate =
+            pcall(
+                makefolder,
+                folder
+            )
+
+        if okCreate then
+            LearningStorage.folderReady = true
+            return true
+        end
+    end
+
+    -- Fallback: keep using the executor workspace root if the executor
+    -- exposes readfile/writefile but no folder API.
+    LearningStorage.folderReady = false
+    LearningStorage.memoryPath = tostring(Config.LearningMemoryName)
+    LearningStorage.logPath = tostring(Config.LearningLogName)
+
+    return false
+end
+
+EnsureLearningWorkspace()
+
+local Learning = {
+    version = 1,
+    loaded = false,
+    persistent = false,
+    dirty = false,
+    lastSave = 0,
+
+    data = {
+        version = 1,
+
+        games = {
+            played = 0,
+            wins = 0,
+            losses = 0,
+            draws = 0,
+            unknown = 0,
+        },
+
+        -- Exact Sunfish position -> our move history.
+        positions = {},
+
+        -- Exact opponent-to-move position -> real replies observed.
+        teacher = {},
+    },
+
+    session = nil,
+    logBuffer = {},
+}
+
+local function LearningMoveId(move)
+    if type(move) ~= "table" then
+        return "?"
+    end
+
+    return table.concat({
+        tostring(move[1] or "?"),
+        tostring(move[2] or "?"),
+        tostring(move[3] or ""),
+        tostring(move[4] or ""),
+    }, ":")
+end
+
+local function LearningMoveCopy(move)
+    if type(move) ~= "table" then
+        return nil
+    end
+
+    return {
+        move[1],
+        move[2],
+        move[3],
+        move[4],
+    }
+end
+
+local function LearningFlags(flags)
+    if type(flags) ~= "table" then
+        return "--"
+    end
+
+    return (
+        tostring(
+            flags[1] == true
+            and 1
+            or 0
+        )
+        .. tostring(
+            flags[2] == true
+            and 1
+            or 0
+        )
+    )
+end
+
+local function LearningPositionKey(position)
+    if type(position) ~= "table"
+        or type(position.board) ~= "string" then
+
+        return nil
+    end
+
+    local board =
+        string.gsub(
+            position.board,
+            "%s",
+            ""
+        )
+
+    return table.concat({
+        board,
+        position.player and "W" or "B",
+        LearningFlags(position.wc),
+        LearningFlags(position.bc),
+        tostring(position.ep or 0),
+        tostring(position.kp or 0),
+    }, "|")
+end
+
+local function LearningTimestamp()
+    local ok, stamp =
+        pcall(
+            os.date,
+            "!%Y-%m-%dT%H:%M:%SZ"
+        )
+
+    return ok
+        and tostring(stamp)
+        or tostring(os.time())
+end
+
+local function LearningLog(text)
+    local line =
+        string.format(
+            "[%s] %s",
+            LearningTimestamp(),
+            tostring(text)
+        )
+
+    print(
+        "[ChessAI Learn]",
+        line
+    )
+
+    Learning.logBuffer[
+        #Learning.logBuffer + 1
+    ] = line
+
+    if type(appendfile) == "function" then
+        local payload =
+            line .. "\n"
+
+        task.spawn(
+            function()
+                pcall(
+                    appendfile,
+                    LearningStorage.logPath,
+                    payload
+                )
+            end
+        )
+
+        Learning.logBuffer = {}
+    end
+end
+
+local function LearningEnsureData(data)
+    if type(data) ~= "table" then
+        return false
+    end
+
+    data.version =
+        tonumber(data.version)
+        or 1
+
+    data.games =
+        type(data.games) == "table"
+        and data.games
+        or {}
+
+    for _, field in ipairs({
+        "played",
+        "wins",
+        "losses",
+        "draws",
+        "unknown",
+    }) do
+        data.games[field] =
+            tonumber(
+                data.games[field]
+            )
+            or 0
+    end
+
+    data.positions =
+        type(data.positions) == "table"
+        and data.positions
+        or {}
+
+    data.teacher =
+        type(data.teacher) == "table"
+        and data.teacher
+        or {}
+
+    return true
+end
+
+local function LearningLoad()
+    if not Config.LearningEnabled
+        or Learning.loaded then
+
+        return
+    end
+
+    Learning.loaded = true
+
+    Learning.persistent =
+        Config.LearningPersistent
+        and type(readfile) == "function"
+        and type(writefile) == "function"
+
+    LearningLog(
+        string.format(
+            "Storage: %s%s",
+            tostring(
+                LearningStorage.memoryPath
+            ),
+            LearningStorage.folderReady
+                and " (workspace folder ready)"
+                or " (workspace-root fallback)"
+        )
+    )
+
+    if not Learning.persistent then
+        LearningLog(
+            "Memory = RAM only (executor has no readfile/writefile)."
+        )
+
+        return
+    end
+
+    local okRead, raw =
+        pcall(
+            readfile,
+            LearningStorage.memoryPath
+        )
+
+    if not okRead
+        or type(raw) ~= "string"
+        or #raw == 0 then
+
+        LearningLog(
+            "No previous memory file; starting fresh."
+        )
+
+        return
+    end
+
+    local okDecode, decoded =
+        pcall(
+            HttpService.JSONDecode,
+            HttpService,
+            raw
+        )
+
+    if okDecode
+        and LearningEnsureData(
+            decoded
+        ) then
+
+        Learning.data = decoded
+
+        LearningLog(
+            string.format(
+                "Loaded memory: %d games • W/D/L %d/%d/%d.",
+                Learning.data.games.played
+                    or 0,
+                Learning.data.games.wins
+                    or 0,
+                Learning.data.games.draws
+                    or 0,
+                Learning.data.games.losses
+                    or 0
+            )
+        )
+    else
+        LearningLog(
+            "Memory JSON decode failed; using fresh RAM memory."
+        )
+    end
+end
+
+local function LearningTrimMap(map)
+    if type(map) ~= "table" then
+        return
+    end
+
+    local count = 0
+
+    for _ in pairs(map) do
+        count += 1
+    end
+
+    if count
+        <= Config.LearningMaxPositions then
+
+        return
+    end
+
+    local entries = {}
+
+    for key, value in pairs(map) do
+        entries[#entries + 1] = {
+            key = key,
+            seen =
+                type(value) == "table"
+                and tonumber(value.seen)
+                or 0,
+        }
+    end
+
+    table.sort(
+        entries,
+        function(a, b)
+            return a.seen < b.seen
+        end
+    )
+
+    local removeCount =
+        count
+        - Config.LearningMaxPositions
+
+    for i = 1, removeCount do
+        map[
+            entries[i].key
+        ] = nil
+    end
+end
+
+local function LearningSave(force)
+    if not Config.LearningEnabled then
+        return
+    end
+
+    if not Learning.dirty
+        and not force then
+
+        return
+    end
+
+    local now =
+        os.clock()
+
+    if not force
+        and now - Learning.lastSave
+            < Config.LearningSaveInterval then
+
+        return
+    end
+
+    Learning.lastSave = now
+
+    LearningTrimMap(
+        Learning.data.positions
+    )
+
+    LearningTrimMap(
+        Learning.data.teacher
+    )
+
+    if Learning.persistent
+        and type(writefile)
+            == "function" then
+
+        local okEncode, raw =
+            pcall(
+                HttpService.JSONEncode,
+                HttpService,
+                Learning.data
+            )
+
+        if okEncode
+            and type(raw) == "string" then
+
+            local okWrite =
+                pcall(
+                    writefile,
+                    LearningStorage.memoryPath,
+                    raw
+                )
+
+            if okWrite then
+                Learning.dirty = false
+            end
+        end
+
+        -- Fallback log persistence if appendfile is unavailable.
+        if #Learning.logBuffer > 0
+            and type(appendfile)
+                ~= "function" then
+
+            local previous = ""
+
+            local okOld, old =
+                pcall(
+                    readfile,
+                    LearningStorage.logPath
+                )
+
+            if okOld
+                and type(old) == "string" then
+
+                previous = old
+            end
+
+            local combined =
+                previous
+                .. table.concat(
+                    Learning.logBuffer,
+                    "\n"
+                )
+                .. "\n"
+
+            if #combined > 250000 then
+                combined =
+                    string.sub(
+                        combined,
+                        #combined - 250000
+                    )
+            end
+
+            pcall(
+                writefile,
+                LearningStorage.logPath,
+                combined
+            )
+
+            Learning.logBuffer = {}
+        end
+    end
+end
+
+local function LearningPositionBucket(
+    positionKey,
+    create
+)
+    if not positionKey then
+        return nil
+    end
+
+    local bucket =
+        Learning.data.positions[
+            positionKey
+        ]
+
+    if not bucket and create then
+        bucket = {
+            seen = 0,
+            moves = {},
+        }
+
+        Learning.data.positions[
+            positionKey
+        ] = bucket
+    end
+
+    return bucket
+end
+
+local function LearningTeacherBucket(
+    positionKey,
+    create
+)
+    if not positionKey then
+        return nil
+    end
+
+    local bucket =
+        Learning.data.teacher[
+            positionKey
+        ]
+
+    if not bucket and create then
+        bucket = {
+            seen = 0,
+            replies = {},
+        }
+
+        Learning.data.teacher[
+            positionKey
+        ] = bucket
+    end
+
+    return bucket
+end
+
+local function LearningGetOwnMoveEntry(
+    positionKey,
+    move,
+    create
+)
+    local bucket =
+        LearningPositionBucket(
+            positionKey,
+            create
+        )
+
+    if not bucket then
+        return nil
+    end
+
+    bucket.moves =
+        type(bucket.moves) == "table"
+        and bucket.moves
+        or {}
+
+    local moveId =
+        LearningMoveId(move)
+
+    local entry =
+        bucket.moves[
+            moveId
+        ]
+
+    if not entry and create then
+        entry = {
+            move =
+                LearningMoveCopy(move),
+            seen = 0,
+            wins = 0,
+            losses = 0,
+            draws = 0,
+            experience = 0,
+            lastEval = 0,
+        }
+
+        bucket.moves[
+            moveId
+        ] = entry
+    end
+
+    return entry,
+        bucket
+end
+
+local function LearningGetTeacherEntry(
+    positionKey,
+    move,
+    create
+)
+    local bucket =
+        LearningTeacherBucket(
+            positionKey,
+            create
+        )
+
+    if not bucket then
+        return nil
+    end
+
+    bucket.replies =
+        type(bucket.replies) == "table"
+        and bucket.replies
+        or {}
+
+    local moveId =
+        LearningMoveId(move)
+
+    local entry =
+        bucket.replies[
+            moveId
+        ]
+
+    if not entry and create then
+        entry = {
+            move =
+                LearningMoveCopy(move),
+            seen = 0,
+            wins = 0,
+            losses = 0,
+            draws = 0,
+            punish = 0,
+        }
+
+        bucket.replies[
+            moveId
+        ] = entry
+    end
+
+    return entry,
+        bucket
+end
+
+local function LearningOwnMoveBias(
+    position,
+    move
+)
+    if not Config.LearningEnabled then
+        return 0
+    end
+
+    local key =
+        LearningPositionKey(
+            position
+        )
+
+    local entry =
+        key
+        and LearningGetOwnMoveEntry(
+            key,
+            move,
+            false
+        )
+
+    if not entry then
+        return 0
+    end
+
+    local games =
+        (tonumber(entry.wins) or 0)
+        + (tonumber(entry.losses) or 0)
+        + (tonumber(entry.draws) or 0)
+
+    if games <= 0 then
+        return 0
+    end
+
+    -- Damped so one lucky result cannot dominate the engine.
+    local history =
+        (
+            (tonumber(entry.wins) or 0)
+            - (tonumber(entry.losses) or 0)
+            + 0.15
+                * (tonumber(entry.draws) or 0)
+        )
+        / (games + 2.5)
+
+    local experience =
+        tonumber(entry.experience)
+        or 0
+
+    return math.clamp(
+        history
+            * Config.LearningMoveBiasMax
+        + experience * 18,
+        -Config.LearningMoveBiasMax,
+        Config.LearningMoveBiasMax
+    )
+end
+
+local function LearningFindLegalStoredMove(
+    position,
+    storedMove
+)
+    if type(position) ~= "table"
+        or type(storedMove) ~= "table" then
+
+        return nil
+    end
+
+    local targetId =
+        LearningMoveId(
+            storedMove
+        )
+
+    local okMoves, moves =
+        pcall(function()
+            return position:genMoves()
+        end)
+
+    if not okMoves
+        or type(moves) ~= "table" then
+
+        return nil
+    end
+
+    for _, move in pairs(moves) do
+        if LearningMoveId(move)
+            == targetId then
+
+            return move
+        end
+    end
+
+    return nil
+end
+
+local function LearningBestTeacherReply(
+    position
+)
+    if not Config.LearningEnabled then
+        return nil
+    end
+
+    local key =
+        LearningPositionKey(
+            position
+        )
+
+    local bucket =
+        key
+        and LearningTeacherBucket(
+            key,
+            false
+        )
+
+    if not bucket
+        or type(bucket.replies)
+            ~= "table" then
+
+        return nil
+    end
+
+    local best
+    local bestWeight =
+        -math.huge
+
+    for _, entry in pairs(
+        bucket.replies
+    ) do
+        if type(entry) == "table"
+            and type(entry.move)
+                == "table" then
+
+            local legal =
+                LearningFindLegalStoredMove(
+                    position,
+                    entry.move
+                )
+
+            if legal then
+                local weight =
+                    (tonumber(entry.punish) or 0)
+                        * 100
+                    + (tonumber(entry.losses) or 0)
+                        * 18
+                    + math.min(
+                        tonumber(entry.seen) or 0,
+                        8
+                    )
+                        * 2
+
+                if weight > bestWeight then
+                    bestWeight = weight
+
+                    best = {
+                        move = legal,
+                        entry = entry,
+                        weight = weight,
+                        positionKey = key,
+                    }
+                end
+            end
+        end
+    end
+
+    return best
+end
+
+local function LearningStartSession(
+    match
+)
+    if not Config.LearningEnabled
+        or type(match) ~= "table" then
+
+        return
+    end
+
+    LearningLoad()
+
+    Learning.session = {
+        matchId = match.id,
+        matchRef = match,
+        localTeam =
+            GetLocalTeam(match),
+        startedAt =
+            os.clock(),
+
+        decisions = {},
+        teacherEvents = {},
+        seenTeacherEvents = {},
+        finalized = false,
+        endDetectedAt = nil,
+    }
+
+    LearningLog(
+        string.format(
+            "MATCH_START id=%s mode=%s team=%s",
+            tostring(match.id),
+            tostring(match.mode),
+            tostring(
+                Learning.session.localTeam
+            )
+        )
+    )
+end
+
+local function LearningEnsureSession(
+    match
+)
+    if not Config.LearningEnabled
+        or type(match) ~= "table" then
+
+        return nil
+    end
+
+    if not Learning.session
+        or Learning.session.matchId
+            ~= match.id then
+
+        LearningStartSession(
+            match
+        )
+    end
+
+    return Learning.session
+end
+
+local function LearningRecordOwnMove(
+    match,
+    position,
+    move,
+    info,
+    source
+)
+    if not Config.LearningEnabled
+        or type(position) ~= "table"
+        or type(move) ~= "table" then
+
+        return
+    end
+
+    local session =
+        LearningEnsureSession(
+            match
+        )
+
+    if not session then
+        return
+    end
+
+    local positionKey =
+        LearningPositionKey(
+            position
+        )
+
+    local entry,
+        bucket =
+        LearningGetOwnMoveEntry(
+            positionKey,
+            move,
+            true
+        )
+
+    if not entry then
+        return
+    end
+
+    entry.seen =
+        (tonumber(entry.seen) or 0)
+        + 1
+
+    entry.lastEval =
+        tonumber(
+            info
+            and info.score
+        )
+        or tonumber(entry.lastEval)
+        or 0
+
+    bucket.seen =
+        (tonumber(bucket.seen) or 0)
+        + 1
+
+    session.decisions[
+        #session.decisions + 1
+    ] = {
+        positionKey =
+            positionKey,
+        moveId =
+            LearningMoveId(move),
+        move =
+            LearningMoveCopy(move),
+        source =
+            source or "AI",
+        eval =
+            tonumber(
+                info
+                and info.score
+            )
+            or 0,
+    }
+
+    Learning.dirty = true
+
+    local thinkTime =
+        info
+        and info.competitive
+        and info.competitive.elapsed
+
+    LearningLog(
+        string.format(
+            "OUR_MOVE id=%s source=%s mode=%s move=%s eval=%+.2f%s",
+            tostring(match.id),
+            tostring(source or "AI"),
+            tostring(Config.Mode),
+            LearningMoveId(move),
+            (
+                tonumber(
+                    info
+                    and info.score
+                )
+                or 0
+            ) / 100,
+            thinkTime
+                and string.format(
+                    " think=%.2fs",
+                    thinkTime
+                )
+                or ""
+        )
+    )
+
+    LearningSave(false)
+end
+
+local function LearningRecordTeacherMove(
+    match,
+    position,
+    move
+)
+    if not Config.LearningEnabled
+        or type(position) ~= "table"
+        or type(move) ~= "table" then
+
+        return
+    end
+
+    local session =
+        LearningEnsureSession(
+            match
+        )
+
+    if not session then
+        return
+    end
+
+    local positionKey =
+        LearningPositionKey(
+            position
+        )
+
+    local eventKey =
+        tostring(positionKey)
+        .. ">"
+        .. LearningMoveId(move)
+
+    if session.seenTeacherEvents[
+        eventKey
+    ] then
+        return
+    end
+
+    session.seenTeacherEvents[
+        eventKey
+    ] = true
+
+    local entry,
+        bucket =
+        LearningGetTeacherEntry(
+            positionKey,
+            move,
+            true
+        )
+
+    if not entry then
+        return
+    end
+
+    entry.seen =
+        (tonumber(entry.seen) or 0)
+        + 1
+
+    bucket.seen =
+        (tonumber(bucket.seen) or 0)
+        + 1
+
+    session.teacherEvents[
+        #session.teacherEvents + 1
+    ] = {
+        positionKey =
+            positionKey,
+        moveId =
+            LearningMoveId(move),
+        move =
+            LearningMoveCopy(move),
+    }
+
+    Learning.dirty = true
+
+    LearningLog(
+        string.format(
+            "TEACHER_REPLY id=%s move=%s seen=%d",
+            tostring(match.id),
+            LearningMoveId(move),
+            tonumber(entry.seen) or 0
+        )
+    )
+
+    LearningSave(false)
+end
+
+local function LearningResolveResult(
+    match,
+    localTeam
+)
+    if type(match) ~= "table" then
+        return "unknown"
+    end
+
+    local winner =
+        match.winner
+
+    if winner == nil
+        or winner == "-"
+        or winner == "" then
+
+        return "unknown"
+    end
+
+    if type(winner) == "boolean"
+        and type(localTeam)
+            == "boolean" then
+
+        return winner == localTeam
+            and "win"
+            or "loss"
+    end
+
+    if typeof(winner) == "Instance"
+        and winner:IsA("Player") then
+
+        return winner == LocalPlayer
+            and "win"
+            or "loss"
+    end
+
+    if type(winner) == "number"
+        and winner
+            == LocalPlayer.UserId then
+
+        return "win"
+    end
+
+    if type(winner) == "string" then
+        local lower =
+            string.lower(winner)
+
+        -- PGN-style result values used by the game's Board module.
+        if winner == "½-½"
+            or lower == "1/2-1/2" then
+
+            return "draw"
+        end
+
+        if winner == "1-0"
+            and type(localTeam)
+                == "boolean" then
+
+            return localTeam
+                and "win"
+                or "loss"
+        end
+
+        if winner == "0-1"
+            and type(localTeam)
+                == "boolean" then
+
+            return not localTeam
+                and "win"
+                or "loss"
+        end
+
+        if string.find(
+                lower,
+                "draw",
+                1,
+                true
+            )
+            or string.find(
+                lower,
+                "remis",
+                1,
+                true
+            )
+            or string.find(
+                lower,
+                "stalemate",
+                1,
+                true
+            )
+            or string.find(
+                lower,
+                "repetition",
+                1,
+                true
+            ) then
+
+            return "draw"
+        end
+
+        if lower == "white"
+            and type(localTeam)
+                == "boolean" then
+
+            return localTeam
+                and "win"
+                or "loss"
+        end
+
+        if lower == "black"
+            and type(localTeam)
+                == "boolean" then
+
+            return not localTeam
+                and "win"
+                or "loss"
+        end
+
+        if lower
+            == string.lower(
+                LocalPlayer.Name
+            )
+            or lower
+                == tostring(
+                    LocalPlayer.UserId
+                ) then
+
+            return "win"
+        end
+    end
+
+    return "unknown"
+end
+
+local function LearningFinalizeSession(
+    result,
+    reason
+)
+    local session =
+        Learning.session
+
+    if not session
+        or session.finalized then
+
+        return
+    end
+
+    session.finalized = true
+
+    result =
+        result
+        or "unknown"
+
+    local games =
+        Learning.data.games
+
+    games.played =
+        (tonumber(games.played) or 0)
+        + 1
+
+    if result == "win" then
+        games.wins =
+            (tonumber(games.wins) or 0)
+            + 1
+
+    elseif result == "loss" then
+        games.losses =
+            (tonumber(games.losses) or 0)
+            + 1
+
+    elseif result == "draw" then
+        games.draws =
+            (tonumber(games.draws) or 0)
+            + 1
+
+    else
+        games.unknown =
+            (tonumber(games.unknown) or 0)
+            + 1
+    end
+
+    local outcome =
+        result == "win"
+            and 1
+        or result == "loss"
+            and -1
+        or result == "draw"
+            and 0.15
+        or 0
+
+    local decisionCount =
+        #session.decisions
+
+    for index, decision in ipairs(
+        session.decisions
+    ) do
+        local entry =
+            LearningGetOwnMoveEntry(
+                decision.positionKey,
+                decision.move,
+                false
+            )
+
+        if entry then
+            local distance =
+                decisionCount
+                - index
+
+            -- Recent decisions get more blame/reward.
+            local credit =
+                0.28
+                + 0.72
+                    * math.exp(
+                        -distance / 6
+                    )
+
+            if result == "win" then
+                entry.wins =
+                    (tonumber(entry.wins) or 0)
+                    + 1
+
+            elseif result == "loss" then
+                entry.losses =
+                    (tonumber(entry.losses) or 0)
+                    + 1
+
+            elseif result == "draw" then
+                entry.draws =
+                    (tonumber(entry.draws) or 0)
+                    + 1
+            end
+
+            entry.experience =
+                (tonumber(entry.experience) or 0)
+                + outcome * credit
+        end
+    end
+
+    local teacherCount =
+        #session.teacherEvents
+
+    for index, event in ipairs(
+        session.teacherEvents
+    ) do
+        local entry =
+            LearningGetTeacherEntry(
+                event.positionKey,
+                event.move,
+                false
+            )
+
+        if entry then
+            local distance =
+                teacherCount
+                - index
+
+            local credit =
+                0.30
+                + 0.70
+                    * math.exp(
+                        -distance / 5
+                    )
+
+            if result == "loss" then
+                entry.losses =
+                    (tonumber(entry.losses) or 0)
+                    + 1
+
+                entry.punish =
+                    (tonumber(entry.punish) or 0)
+                    + credit
+
+            elseif result == "win" then
+                entry.wins =
+                    (tonumber(entry.wins) or 0)
+                    + 1
+
+                entry.punish =
+                    math.max(
+                        0,
+                        (tonumber(entry.punish) or 0)
+                        - 0.12 * credit
+                    )
+
+            elseif result == "draw" then
+                entry.draws =
+                    (tonumber(entry.draws) or 0)
+                    + 1
+
+                entry.punish =
+                    (tonumber(entry.punish) or 0)
+                    + 0.08 * credit
+            end
+        end
+    end
+
+    Learning.dirty = true
+
+    LearningLog(
+        string.format(
+            "MATCH_RESULT id=%s result=%s reason=%s decisions=%d teacher=%d | W/D/L=%d/%d/%d",
+            tostring(session.matchId),
+            tostring(result),
+            tostring(reason or "?"),
+            decisionCount,
+            teacherCount,
+            games.wins or 0,
+            games.draws or 0,
+            games.losses or 0
+        )
+    )
+
+    LearningSave(true)
+    Learning.session = nil
+end
+
+local function LearningPollResult()
+    local session =
+        Learning.session
+
+    if not session
+        or session.finalized then
+
+        return
+    end
+
+    local match =
+        session.matchRef
+
+    if type(match) == "table"
+        and match.gameEnded == true then
+
+        local result =
+            LearningResolveResult(
+                match,
+                session.localTeam
+            )
+
+        if result == "unknown" then
+            session.endDetectedAt =
+                session.endDetectedAt
+                or os.clock()
+
+            -- Winner may update a fraction later than gameEnded.
+            if os.clock()
+                - session.endDetectedAt
+                < 1.25 then
+
+                return
+            end
+        end
+
+        LearningFinalizeSession(
+            result,
+            "gameEnded"
+        )
+    end
+end
+
+LearningLoad()
 
 --// ============================================================
 --// v4.8 MIDGAME FEN/HISTORY REPLAY
@@ -2012,9 +3479,12 @@ local function ApplyConfirmedMoveToShadow(fromPos, toMove)
         return
     end
 
+    local positionBefore =
+        Shadow.position
+
     local move =
         MatchMoveToSunfish(
-            Shadow.position,
+            positionBefore,
             fromPos,
             toMove
         )
@@ -2039,9 +3509,41 @@ local function ApplyConfirmedMoveToShadow(fromPos, toMove)
         return
     end
 
+    local liveMatch =
+        GetCurrentMatch()
+
+    if liveMatch then
+        local localTeam =
+            GetLocalTeam(
+                liveMatch
+            )
+
+        if type(localTeam)
+            == "boolean" then
+
+            if positionBefore.player
+                == localTeam then
+
+                LearningRecordOwnMove(
+                    liveMatch,
+                    positionBefore,
+                    move,
+                    nil,
+                    "MANUAL"
+                )
+            else
+                LearningRecordTeacherMove(
+                    liveMatch,
+                    positionBefore,
+                    move
+                )
+            end
+        end
+    end
+
     local ok, nextPos =
         pcall(function()
-            return Shadow.position:move(move)
+            return positionBefore:move(move)
         end)
 
     if not ok
@@ -2572,6 +4074,41 @@ local function ProbeOpponentAfterMove(
         or FinalSearchScore(results)
         or 0
 
+    local teacher =
+        LearningBestTeacherReply(
+            nextPosition
+        )
+
+    local teacherUsed = false
+
+    if teacher
+        and teacher.entry
+        and (tonumber(
+            teacher.entry.losses
+        ) or 0) >= 1
+        and (tonumber(
+            teacher.entry.punish
+        ) or 0) >= 0.45 then
+
+        enemyMove =
+            teacher.move
+
+        teacherUsed = true
+
+        enemyScore =
+            math.max(
+                enemyScore,
+                260
+                    + (
+                        tonumber(
+                            teacher.entry.punish
+                        )
+                        or 0
+                    )
+                        * 220
+            )
+    end
+
     local mateDanger =
         (
             type(mateState) == "number"
@@ -2594,6 +4131,12 @@ local function ProbeOpponentAfterMove(
             CandidateGap(results),
         settings = settings,
         results = results,
+
+        teacherUsed =
+            teacherUsed,
+
+        teacher =
+            teacher,
     }
 end
 
@@ -3514,12 +5057,231 @@ end
 --// modern native Stockfish build.
 --// ============================================================
 
+
+local function NormalizeClockSeconds(value)
+    value =
+        tonumber(value)
+
+    if not value
+        or value < 0 then
+
+        return nil
+    end
+
+    if value > 36000 then
+        value /= 1000
+    end
+
+    return value
+end
+
+local function ParseClockReturn(
+    value,
+    team
+)
+    if type(value) == "number" then
+        return NormalizeClockSeconds(
+            value
+        )
+    end
+
+    if type(value) ~= "table" then
+        return nil
+    end
+
+    local candidates = {
+        value[team],
+        value[
+            team
+            and "white"
+            or "black"
+        ],
+        value[
+            team
+            and "White"
+            or "Black"
+        ],
+        value[
+            team
+            and 1
+            or 2
+        ],
+        value.remaining,
+        value.time,
+    }
+
+    for _, candidate in ipairs(
+        candidates
+    ) do
+        local seconds =
+            NormalizeClockSeconds(
+                candidate
+            )
+
+        if seconds then
+            return seconds
+        end
+    end
+
+    return nil
+end
+
+local function GetClockRemainingSeconds(
+    match,
+    team
+)
+    if type(match) ~= "table"
+        or type(match.chessClock)
+            ~= "table" then
+
+        return nil
+    end
+
+    local clock =
+        match.chessClock
+
+    if type(
+        clock.getRemainingTime
+    ) ~= "function" then
+
+        return nil
+    end
+
+    local ok, value =
+        pcall(
+            clock.getRemainingTime,
+            clock,
+            team
+        )
+
+    if ok then
+        local parsed =
+            ParseClockReturn(
+                value,
+                team
+            )
+
+        if parsed then
+            return parsed
+        end
+    end
+
+    ok, value =
+        pcall(
+            clock.getRemainingTime,
+            clock
+        )
+
+    if ok then
+        return ParseClockReturn(
+            value,
+            team
+        )
+    end
+
+    return nil
+end
+
+local function CompetitiveBudgetForClock(
+    match,
+    team
+)
+    local remaining =
+        GetClockRemainingSeconds(
+            match,
+            team
+        )
+
+    local budget = {
+        root =
+            Config.CompetitiveRootNodes,
+        probe =
+            Config.CompetitiveProbeNodes,
+        deep =
+            Config.CompetitiveDeepProbeNodes,
+        recovery =
+            Config.CompetitiveRecoveryNodes,
+
+        candidates =
+            Config.CompetitiveCandidateLimit,
+        finalists =
+            Config.CompetitiveFinalists,
+
+        targetSeconds =
+            Config.CompetitiveThinkTarget,
+
+        remainingSeconds =
+            remaining,
+    }
+
+    if remaining
+        and remaining
+            <= Config.CompetitivePanicTimeSeconds then
+
+        budget.root = 5500
+        budget.probe = 0
+        budget.deep = 0
+        budget.recovery = 0
+        budget.candidates = 1
+        budget.finalists = 0
+        budget.targetSeconds = 1.2
+
+    elseif remaining
+        and remaining
+            <= Config.CompetitiveCriticalTimeSeconds then
+
+        budget.root = 8000
+        budget.probe = 2200
+        budget.deep = 0
+        budget.recovery = 0
+        budget.candidates = 2
+        budget.finalists = 0
+        budget.targetSeconds = 2.0
+
+    elseif remaining
+        and remaining
+            <= Config.CompetitiveLowTimeSeconds then
+
+        budget.root = 12500
+        budget.probe = 3000
+        budget.deep = 5000
+        budget.recovery = 0
+        budget.candidates = 2
+        budget.finalists = 1
+        budget.targetSeconds = 3.2
+    end
+
+    return budget
+end
+
+local function CompetitiveDeadlinePassed(
+    deadline,
+    reserve
+)
+    return os.clock()
+        >= deadline
+            - (reserve or 0)
+end
+
 local function RunCompetitiveBudget(
     position,
     nodes,
     minDepth,
     label
 )
+    nodes =
+        tonumber(nodes)
+        or 0
+
+    if nodes <= 0 then
+        return nil, {
+            error =
+                "COMP SKIPPED ["
+                .. tostring(label)
+                .. "]",
+        }
+    end
+
     local settings =
         DeepCopy(
             Profiles.Competitive
@@ -3541,6 +5303,9 @@ local function RunCompetitiveBudget(
 
     settings.worseMoveChance = 0
 
+    local searchStart =
+        os.clock()
+
     local okSearch,
         results,
         mateState =
@@ -3551,6 +5316,10 @@ local function RunCompetitiveBudget(
             settings.depth,
             settings
         )
+
+    local elapsed =
+        os.clock()
+        - searchStart
 
     if not okSearch then
         return nil, {
@@ -3609,6 +5378,9 @@ local function RunCompetitiveBudget(
         selectedMode = "Competitive",
         candidateGap =
             CandidateGap(results),
+
+        elapsed =
+            elapsed,
     }
 end
 
@@ -3655,6 +5427,46 @@ local function CompetitiveOpponentProbe(
         tonumber(enemyInfo.score)
         or 0
 
+    local teacher =
+        LearningBestTeacherReply(
+            nextPosition
+        )
+
+    local teacherUsed = false
+
+    if teacher
+        and teacher.entry then
+
+        local punish =
+            tonumber(
+                teacher.entry.punish
+            )
+            or 0
+
+        local learnedLosses =
+            tonumber(
+                teacher.entry.losses
+            )
+            or 0
+
+        if learnedLosses >= 1
+            and punish >= 0.45 then
+
+            enemyMove =
+                teacher.move
+
+            teacherUsed = true
+
+            enemyScore =
+                math.max(
+                    enemyScore,
+                    260
+                        + punish
+                            * 220
+                )
+        end
+    end
+
     local mateDanger =
         (
             type(enemyInfo.mateState)
@@ -3672,6 +5484,12 @@ local function CompetitiveOpponentProbe(
         severeDanger =
             mateDanger
             or enemyScore >= 1200,
+
+        teacherUsed =
+            teacherUsed,
+
+        teacher =
+            teacher,
     }
 end
 
@@ -3712,11 +5530,29 @@ local function AddCompetitiveCandidate(
 
     seen[key] = true
 
+    local memoryBias =
+        LearningOwnMoveBias(
+            position,
+            move
+        )
+
     pool[#pool + 1] = {
         move = move,
+
         ownScore =
+            (
+                tonumber(ownScore)
+                or -90000
+            )
+            + memoryBias,
+
+        rawScore =
             tonumber(ownScore)
             or -90000,
+
+        memoryBias =
+            memoryBias,
+
         source = source,
         resolved = resolved,
     }
@@ -3806,7 +5642,8 @@ local function BuildCompetitiveCandidatePool(
 end
 
 local function CompetitiveRecoveryScore(
-    opponentAudit
+    opponentAudit,
+    nodeBudget
 )
     if type(opponentAudit) ~= "table"
         or type(opponentAudit.enemyMove)
@@ -3837,7 +5674,8 @@ local function CompetitiveRecoveryScore(
         ourInfo =
         RunCompetitiveBudget(
             ourPosition,
-            Config.CompetitiveRecoveryNodes,
+            tonumber(nodeBudget)
+                or Config.CompetitiveRecoveryNodes,
             14,
             "RECOVERY"
         )
@@ -3906,13 +5744,35 @@ local function CompetitiveSearch(
         }
     end
 
+    local budget =
+        CompetitiveBudgetForClock(
+            match,
+            team
+        )
+
+    local startedAt =
+        os.clock()
+
+    local deadline =
+        startedAt
+        + budget.targetSeconds
+
+    local clockText =
+        budget.remainingSeconds
+        and string.format(
+            " • clock %.0fs",
+            budget.remainingSeconds
+        )
+        or ""
+
     SetThinkingNarrative(
         string.format(
-            "Competitive: root search %dk nodes. Không dùng Easy/Normal và không majority vote.",
+            "Competitive FAST: root %dk%s • target %.1fs.",
             math.floor(
-                Config.CompetitiveRootNodes
-                / 1000
-            )
+                budget.root / 1000
+            ),
+            clockText,
+            budget.targetSeconds
         ),
         "thinking"
     )
@@ -3921,7 +5781,7 @@ local function CompetitiveSearch(
         rootInfo =
         RunCompetitiveBudget(
             position,
-            Config.CompetitiveRootNodes,
+            budget.root,
             Config.CompetitiveMinDepth,
             "ROOT"
         )
@@ -3937,6 +5797,39 @@ local function CompetitiveSearch(
             }
     end
 
+    if budget.candidates <= 1
+        or budget.probe <= 0
+        or CompetitiveDeadlinePassed(
+            deadline,
+            0.55
+        ) then
+
+        rootInfo.selectedMode =
+            "Competitive"
+
+        rootInfo.competitive = {
+            fastExit = true,
+            elapsed =
+                os.clock()
+                - startedAt,
+            remainingSeconds =
+                budget.remainingSeconds,
+        }
+
+        rootInfo.skipPrediction = true
+
+        SetThinkingNarrative(
+            string.format(
+                "Competitive FAST chốt root sau %.1fs để giữ clock.",
+                rootInfo.competitive.elapsed
+            ),
+            "decision"
+        )
+
+        return rootMove,
+            rootInfo
+    end
+
     local pool =
         BuildCompetitiveCandidatePool(
             match,
@@ -3946,27 +5839,53 @@ local function CompetitiveSearch(
             rootInfo
         )
 
-    if #pool == 0 then
-        return rootMove,
-            rootInfo
+    while #pool
+        > budget.candidates do
+
+        table.remove(pool)
     end
 
-    SetThinkingNarrative(
-        string.format(
-            "Competitive: %d candidate hợp lệ. Đang giả lập best response của đối thủ...",
-            #pool
-        ),
-        "thinking"
-    )
+    if #pool == 0 then
+        rootInfo.skipPrediction = true
+        return rootMove, rootInfo
+    end
 
     local fastAudits = {}
 
     for index, entry in ipairs(pool) do
+        if CompetitiveDeadlinePassed(
+            deadline,
+            0.70
+        ) then
+            break
+        end
+
+        local memoryText = ""
+
+        if math.abs(
+            entry.memoryBias
+            or 0
+        ) >= 1 then
+
+            memoryText =
+                string.format(
+                    " • memory %+d",
+                    math.floor(
+                        entry.memoryBias
+                    )
+                )
+        end
+
         SetThinkingNarrative(
             string.format(
-                "Anti-engine probe %d/%d: đối thủ sẽ phản công thế nào?",
+                "Probe %d/%d • %dk%s.",
                 index,
-                #pool
+                #pool,
+                math.floor(
+                    budget.probe
+                    / 1000
+                ),
+                memoryText
             ),
             "thinking"
         )
@@ -3975,13 +5894,22 @@ local function CompetitiveSearch(
             CompetitiveOpponentProbe(
                 position,
                 entry.move,
-                Config.CompetitiveProbeNodes,
+                budget.probe,
                 "PROBE "
                     .. tostring(index)
             )
 
         if type(audit) == "table" then
-            fastAudits[#fastAudits + 1] = {
+            if audit.teacherUsed then
+                SetThinkingNarrative(
+                    "Teacher Memory: phản đòn này từng xuất hiện trong một trận thua; ép nó vào line.",
+                    "warning"
+                )
+            end
+
+            fastAudits[
+                #fastAudits + 1
+            ] = {
                 entry = entry,
                 audit = audit,
             }
@@ -3994,7 +5922,12 @@ local function CompetitiveSearch(
         rootInfo.competitive = {
             candidateCount = #pool,
             fallback = true,
+            elapsed =
+                os.clock()
+                - startedAt,
         }
+
+        rootInfo.skipPrediction = true
 
         return rootMove,
             rootInfo
@@ -4021,112 +5954,73 @@ local function CompetitiveSearch(
         end
     )
 
-    local finalistCount =
-        math.min(
-            #fastAudits,
-            Config.CompetitiveFinalists
-        )
+    local winner =
+        fastAudits[1]
 
-    SetThinkingNarrative(
-        string.format(
-            "Giữ %d finalist an toàn nhất. Bắt đầu deep adversarial verification...",
-            finalistCount
-        ),
-        "thinking"
-    )
-
-    local finals = {}
-
-    for i = 1, finalistCount do
-        local entry =
-            fastAudits[i].entry
+    if budget.finalists > 0
+        and budget.deep > 0
+        and not CompetitiveDeadlinePassed(
+            deadline,
+            1.05
+        ) then
 
         SetThinkingNarrative(
             string.format(
-                "Deep verify %d/%d • %dk nodes phản đòn.",
-                i,
-                finalistCount,
+                "Deep finalist • %dk.",
                 math.floor(
-                    Config.CompetitiveDeepProbeNodes
-                    / 1000
+                    budget.deep / 1000
                 )
             ),
             "thinking"
         )
 
-        local audit =
+        local deepAudit =
             CompetitiveOpponentProbe(
                 position,
-                entry.move,
-                Config.CompetitiveDeepProbeNodes,
-                "DEEP "
-                    .. tostring(i)
+                winner.entry.move,
+                budget.deep,
+                "FINAL"
             )
 
-        if type(audit) == "table" then
-            local recoveryScore,
-                recoveryInfo =
-                CompetitiveRecoveryScore(
-                    audit
-                )
-
-            finals[#finals + 1] = {
-                entry = entry,
-                audit = audit,
-                recoveryScore =
-                    recoveryScore,
-                recoveryInfo =
-                    recoveryInfo,
-                utility =
-                    CompetitiveUtility(
-                        entry,
-                        audit,
-                        recoveryScore
-                    ),
-            }
+        if type(deepAudit) == "table" then
+            winner.audit =
+                deepAudit
         end
-
-        task.wait()
     end
 
-    if #finals == 0 then
-        local fallback =
-            fastAudits[1]
+    local recoveryScore = 0
+    local recoveryInfo
 
-        rootInfo.competitive = {
-            candidateCount = #pool,
-            finalistCount = 0,
-            fallback = true,
-            enemyScore =
-                fallback.audit.enemyScore,
-        }
+    if budget.recovery > 0
+        and not CompetitiveDeadlinePassed(
+            deadline,
+            0.70
+        ) then
 
-        return fallback.entry.move,
-            rootInfo
+        recoveryScore,
+            recoveryInfo =
+            CompetitiveRecoveryScore(
+                winner.audit,
+                budget.recovery
+            )
     end
 
-    table.sort(
-        finals,
-        function(a, b)
-            if a.audit.mateDanger
-                ~= b.audit.mateDanger then
+    winner.recoveryScore =
+        recoveryScore
 
-                return not a.audit.mateDanger
-            end
+    winner.recoveryInfo =
+        recoveryInfo
 
-            return a.utility
-                > b.utility
-        end
-    )
-
-    local winner =
-        finals[1]
+    winner.utility =
+        CompetitiveUtility(
+            winner.entry,
+            winner.audit,
+            recoveryScore
+        )
 
     local selectedMove =
         winner.entry.move
 
-    -- Preserve root telemetry, but update values that should represent
-    -- the actual selected competitive move.
     local selectedInfo =
         rootInfo
 
@@ -4141,20 +6035,18 @@ local function CompetitiveSearch(
             or 0
         )
 
-    -- Root mateState may belong to a different root candidate after
-    -- adversarial verification changes the selected move.
     selectedInfo.mateState = nil
 
     selectedInfo.competitive = {
         candidateCount = #pool,
-        finalistCount =
-            finalistCount,
+        probedCount =
+            #fastAudits,
 
         enemyScore =
             winner.audit.enemyScore,
 
         recoveryScore =
-            winner.recoveryScore,
+            recoveryScore,
 
         utility =
             winner.utility,
@@ -4162,12 +6054,25 @@ local function CompetitiveSearch(
         mateDanger =
             winner.audit.mateDanger,
 
+        teacherUsed =
+            winner.audit.teacherUsed
+            or false,
+
+        memoryBias =
+            winner.entry.memoryBias
+            or 0,
+
         source =
             winner.entry.source,
+
+        elapsed =
+            os.clock()
+            - startedAt,
+
+        remainingSeconds =
+            budget.remainingSeconds,
     }
 
-    -- Reuse the already-computed deep opponent line as Enemy Prediction,
-    -- avoiding one extra expensive search in Analyze().
     selectedInfo.precomputedPrediction = {
         move =
             winner.audit.enemyMove,
@@ -4196,17 +6101,22 @@ local function CompetitiveSearch(
 
     if winner.audit.mateDanger then
         SetThinkingNarrative(
-            "Competitive cảnh báo: mọi finalist sâu đều cho đối thủ mating line. Đã chọn line kéo dài tốt nhất.",
+            string.format(
+                "Competitive FAST: mate danger • chốt line tốt nhất sau %.1fs.",
+                selectedInfo.competitive.elapsed
+            ),
             "warning"
         )
     else
         SetThinkingNarrative(
             string.format(
-                "Competitive chốt worst-case line • enemy eval %+0.2f • recovery %+0.2f.",
+                "Competitive FAST %.1fs • enemy %+0.2f%s.",
+                selectedInfo.competitive.elapsed,
                 winner.audit.enemyScore
                     / 100,
-                winner.recoveryScore
-                    / 100
+                winner.audit.teacherUsed
+                    and " • TEACHER"
+                    or ""
             ),
             "decision"
         )
@@ -7028,13 +8938,24 @@ local function Analyze(
             "thinking"
         )
 
-        if not usedEmergency
+        if Config.Mode == "Competitive"
+            and info.skipPrediction then
+
+            prediction = nil
+
+        elseif not usedEmergency
             and info.precomputedPrediction
             and MoveIdentity(actualMove)
                 == MoveIdentity(bestMove) then
 
             prediction =
                 info.precomputedPrediction
+
+        elseif Config.Mode == "Competitive" then
+            -- Do not start a second large search after the time-controlled
+            -- Competitive controller has already finished.
+            prediction = nil
+
         else
             prediction =
                 PredictEnemyReply(
@@ -7270,6 +9191,16 @@ local function Analyze(
         return false
     end
 
+    LearningRecordOwnMove(
+        liveMatch,
+        info.position,
+        actualMove,
+        info,
+        usedEmergency
+            and "AI_EMERGENCY"
+            or "AI"
+    )
+
     -- PvP FIX:
     -- MovePiece.OnClientEvent does not reliably echo our own move.
     -- Without this local commit the shadow position stays one ply
@@ -7346,6 +9277,9 @@ task.spawn(function()
             Config.PollRate
         )
 
+        LearningPollResult()
+        LearningSave(false)
+
         local match =
             GetCurrentMatch()
 
@@ -7353,6 +9287,8 @@ task.spawn(function()
             SetHUDSleeping(true)
 
             if LastMatchId ~= nil then
+                LearningPollResult()
+
                 LastMatchId = nil
                 LastAutoRound = nil
                 ResetShadow(nil)
@@ -7378,6 +9314,7 @@ task.spawn(function()
             LastAutoRound = nil
             ResetShadow(match)
             ResetAnalysisHUD()
+            LearningStartSession(match)
 
             SetStatus(
                 "MATCH "
@@ -7456,9 +9393,15 @@ SetHUDSleeping(true)
 SetStatus("READY", false)
 
 print(
-    "[ChessAI] v4.9 loaded • Competitive anti-engine mode",
+    "[ChessAI] v5.0.1 loaded • Workspace Memory Storage",
     "| Mode:",
     Config.Mode,
+    "| Memory:",
+    Learning.persistent
+        and "persistent"
+        or "RAM",
+    "| Save:",
+    LearningStorage.memoryPath,
     "| Remote:",
     MovePieceRemote:GetFullName()
 )
