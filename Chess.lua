@@ -1,5 +1,5 @@
 --[[
-    Chess AI Client v5.1 - Draw Result + Teacher Replay + Repetition Learning
+    Chess AI Client v6.0 - Native Neural Value Learning
     Compact dropdown GUI + Original Game Sunfish + Visual Tracer
 
     Features
@@ -157,6 +157,47 @@ local Config = {
     LearningDrawWinningPenalty = 0.32,
     LearningDrawLosingReward = 0.22,
     LearningRepetitionRecentPenalty = 0.95,
+
+    -- Native neural value learner (pure Luau).
+    --
+    -- Input:
+    --   128 board channels + 16 engine/state features = 144
+    -- Network:
+    --   144 -> 96 -> 48 -> 24 -> 1
+    --
+    -- Hidden layers use ReLU, output uses tanh [-1, +1].
+    NeuralEnabled = true,
+    NeuralPersistent = true,
+
+    NeuralWeightsName = "NeuralWeights_v1.json",
+    NeuralReplayName = "NeuralReplay_v1.json",
+    NeuralStatsName = "NeuralStats_v1.json",
+
+    NeuralInputSize = 144,
+    NeuralArchitecture = {144, 96, 48, 24, 1},
+
+    NeuralReplayMax = 800,
+    NeuralBatchSize = 5,
+    NeuralGamma = 0.985,
+    NeuralLearningRate = 0.0012,
+    NeuralWeightDecay = 0.000002,
+    NeuralGradientClip = 1.5,
+
+    -- Training is deliberately off during live play.
+    NeuralEndGameBatches = 14,
+    NeuralIdleBatches = 1,
+    NeuralIdleInterval = 5.0,
+    NeuralSaveEveryUpdates = 20,
+
+    -- Network influence starts near zero and ramps up only after it
+    -- has accumulated enough real training updates.
+    NeuralMinUpdates = 8,
+    NeuralFullInfluenceUpdates = 500,
+    NeuralMinReplayForTraining = 16,
+
+    -- Maximum candidate contribution in centipawn-like units.
+    NeuralInfluenceCp = 190,
+    NeuralAutomaticCandidates = 3,
 
     -- Enemy reply search uses a fraction of the selected mode's nodes
     -- so Nightmare does not perform two full 65k-node searches every turn.
@@ -1185,6 +1226,36 @@ end
 
 EnsureLearningWorkspace()
 
+LearningStorage.neuralWeightsPath =
+    LearningStorage.folderReady
+    and JoinWorkspacePath(
+        Config.LearningFolder,
+        Config.NeuralWeightsName
+    )
+    or tostring(
+        Config.NeuralWeightsName
+    )
+
+LearningStorage.neuralReplayPath =
+    LearningStorage.folderReady
+    and JoinWorkspacePath(
+        Config.LearningFolder,
+        Config.NeuralReplayName
+    )
+    or tostring(
+        Config.NeuralReplayName
+    )
+
+LearningStorage.neuralStatsPath =
+    LearningStorage.folderReady
+    and JoinWorkspacePath(
+        Config.LearningFolder,
+        Config.NeuralStatsName
+    )
+    or tostring(
+        Config.NeuralStatsName
+    )
+
 local Learning = {
     version = 2,
     loaded = false,
@@ -1960,6 +2031,11 @@ local function LearningStartSession(
         repetitionDraw = false,
         repetitionKey = nil,
 
+        -- v6 neural trajectory: only positions where it is our turn are
+        -- used for full-ply TD transitions.
+        neuralPendingState = nil,
+        neuralTrajectory = {},
+
         resultHint = nil,
         resultReason = nil,
         endRemoteSeen = false,
@@ -2647,6 +2723,20 @@ local function LearningFinalizeSession(
         )
     )
 
+    if type(
+        Learning.Neural
+    ) == "table"
+        and type(
+            Learning.Neural.FinalizeGame
+        ) == "function" then
+
+        Learning.Neural.FinalizeGame(
+            session,
+            result,
+            reason
+        )
+    end
+
     LearningSave(true)
     Learning.session = nil
 end
@@ -2741,7 +2831,2173 @@ local function LearningPollResult()
     )
 end
 
+
+--// ============================================================
+--// v6 NATIVE NEURAL VALUE NETWORK
+--//
+--// Pure Luau implementation:
+--//   144 -> 96 -> 48 -> 24 -> 1
+--//   ReLU hidden layers
+--//   tanh value output
+--//   SGD + gradient clipping + tiny L2 decay
+--//   prioritized replay
+--//   TD learning + Monte-Carlo terminal targets
+--//
+--// The model predicts position value from OUR side's perspective.
+--// Sunfish remains the chess search backbone; neural output is a
+--// gradually-ramped candidate reranking signal.
+--// ============================================================
+
+Learning.Neural = {
+    version = 1,
+    loaded = false,
+    persistent = false,
+    training = false,
+    jobRunning = false,
+
+    model = nil,
+
+    replay = {
+        version = 1,
+        samples = {},
+        added = 0,
+    },
+
+    stats = {
+        version = 1,
+        games = 0,
+        wins = 0,
+        draws = 0,
+        losses = 0,
+        unknown = 0,
+
+        updates = 0,
+        samplesSeen = 0,
+        lastLoss = 0,
+        avgLoss = 0,
+        lastTrainSeconds = 0,
+    },
+
+    dirtyWeights = false,
+    dirtyReplay = false,
+    dirtyStats = false,
+
+    lastSaveUpdate = 0,
+    lastIdleTrain = 0,
+}
+
+Learning.Neural.Tanh = function(x)
+    x =
+        math.clamp(
+            tonumber(x) or 0,
+            -20,
+            20
+        )
+
+    local e =
+        math.exp(
+            2 * x
+        )
+
+    return (e - 1)
+        / (e + 1)
+end
+
+Learning.Neural.RandomWeight = function(inputSize)
+    local limit =
+        math.sqrt(
+            6
+            / math.max(
+                tonumber(inputSize) or 1,
+                1
+            )
+        )
+
+    return (
+        math.random() * 2 - 1
+    ) * limit
+end
+
+Learning.Neural.NewLayer = function(inputSize, outputSize)
+    local layer = {
+        inputSize = inputSize,
+        outputSize = outputSize,
+        weights = {},
+        bias = {},
+    }
+
+    local total =
+        inputSize
+        * outputSize
+
+    for index = 1, total do
+        layer.weights[index] =
+            Learning.Neural.RandomWeight(
+                inputSize
+            )
+    end
+
+    for index = 1, outputSize do
+        layer.bias[index] = 0
+    end
+
+    return layer
+end
+
+Learning.Neural.NewModel = function()
+    local architecture =
+        Config.NeuralArchitecture
+
+    local model = {
+        version = 1,
+        architecture = {},
+        layers = {},
+    }
+
+    for index, size in ipairs(
+        architecture
+    ) do
+        model.architecture[index] =
+            tonumber(size)
+    end
+
+    for index = 1,
+        #architecture - 1 do
+
+        model.layers[index] =
+            Learning.Neural.NewLayer(
+                architecture[index],
+                architecture[index + 1]
+            )
+    end
+
+    return model
+end
+
+Learning.Neural.ValidateModel = function(model)
+    if type(model) ~= "table"
+        or type(model.architecture) ~= "table"
+        or type(model.layers) ~= "table" then
+
+        return false
+    end
+
+    if #model.architecture
+        ~= #Config.NeuralArchitecture then
+
+        return false
+    end
+
+    for index, expected in ipairs(
+        Config.NeuralArchitecture
+    ) do
+        if tonumber(
+            model.architecture[index]
+        ) ~= expected then
+
+            return false
+        end
+    end
+
+    if #model.layers
+        ~= #Config.NeuralArchitecture - 1 then
+
+        return false
+    end
+
+    for index, layer in ipairs(
+        model.layers
+    ) do
+        local inputSize =
+            Config.NeuralArchitecture[index]
+
+        local outputSize =
+            Config.NeuralArchitecture[index + 1]
+
+        if type(layer) ~= "table"
+            or tonumber(layer.inputSize)
+                ~= inputSize
+            or tonumber(layer.outputSize)
+                ~= outputSize
+            or type(layer.weights)
+                ~= "table"
+            or type(layer.bias)
+                ~= "table"
+            or #layer.weights
+                ~= inputSize * outputSize
+            or #layer.bias
+                ~= outputSize then
+
+            return false
+        end
+    end
+
+    return true
+end
+
+Learning.Neural.SafeDecodeFile = function(path)
+    if type(readfile) ~= "function" then
+        return nil
+    end
+
+    local okRead, raw =
+        pcall(
+            readfile,
+            path
+        )
+
+    if not okRead
+        or type(raw) ~= "string"
+        or #raw == 0 then
+
+        return nil
+    end
+
+    local okDecode, data =
+        pcall(
+            HttpService.JSONDecode,
+            HttpService,
+            raw
+        )
+
+    if not okDecode then
+        return nil
+    end
+
+    return data
+end
+
+Learning.Neural.SafeEncodeFile = function(path, data)
+    if type(writefile) ~= "function" then
+        return false
+    end
+
+    local okEncode, raw =
+        pcall(
+            HttpService.JSONEncode,
+            HttpService,
+            data
+        )
+
+    if not okEncode
+        or type(raw) ~= "string" then
+
+        return false
+    end
+
+    return pcall(
+        writefile,
+        path,
+        raw
+    )
+end
+
+Learning.Neural.Load = function()
+    if Learning.Neural.loaded
+        or not Config.NeuralEnabled then
+
+        return
+    end
+
+    Learning.Neural.loaded = true
+
+    Learning.Neural.persistent =
+        Config.NeuralPersistent
+        and type(readfile) == "function"
+        and type(writefile) == "function"
+
+    local weights =
+        Learning.Neural.SafeDecodeFile(
+            LearningStorage.neuralWeightsPath
+        )
+
+    if Learning.Neural.ValidateModel(
+        weights
+    ) then
+        Learning.Neural.model = weights
+    else
+        Learning.Neural.model =
+            Learning.Neural.NewModel()
+
+        Learning.Neural.dirtyWeights = true
+    end
+
+    local replay =
+        Learning.Neural.SafeDecodeFile(
+            LearningStorage.neuralReplayPath
+        )
+
+    if type(replay) == "table"
+        and type(replay.samples) == "table" then
+
+        Learning.Neural.replay = replay
+
+        Learning.Neural.replay.version =
+            tonumber(
+                Learning.Neural.replay.version
+            )
+            or 1
+
+        Learning.Neural.replay.added =
+            tonumber(
+                Learning.Neural.replay.added
+            )
+            or #Learning.Neural.replay.samples
+    end
+
+    local stats =
+        Learning.Neural.SafeDecodeFile(
+            LearningStorage.neuralStatsPath
+        )
+
+    if type(stats) == "table" then
+        for key, defaultValue in pairs(
+            Learning.Neural.stats
+        ) do
+            if stats[key] ~= nil then
+                Learning.Neural.stats[key] =
+                    stats[key]
+            else
+                Learning.Neural.stats[key] =
+                    defaultValue
+            end
+        end
+    end
+
+    -- Trim a replay file if config was reduced between versions.
+    while #Learning.Neural.replay.samples
+        > Config.NeuralReplayMax do
+
+        table.remove(
+            Learning.Neural.replay.samples,
+            1
+        )
+    end
+
+    LearningLog(
+        string.format(
+            "NEURAL_LOAD arch=144>96>48>24>1 replay=%d updates=%d loss=%.5f mode=%s",
+            #Learning.Neural.replay.samples,
+            tonumber(
+                Learning.Neural.stats.updates
+            ) or 0,
+            tonumber(
+                Learning.Neural.stats.avgLoss
+            ) or 0,
+            Learning.Neural.persistent
+                and "persistent"
+                or "RAM"
+        )
+    )
+end
+
+Learning.Neural.Save = function(force)
+    if not Config.NeuralEnabled
+        or not Learning.Neural.loaded then
+
+        return
+    end
+
+    if not Learning.Neural.persistent then
+        return
+    end
+
+    local updates =
+        tonumber(
+            Learning.Neural.stats.updates
+        )
+        or 0
+
+    if not force
+        and updates
+            - Learning.Neural.lastSaveUpdate
+            < Config.NeuralSaveEveryUpdates then
+
+        return
+    end
+
+    Learning.Neural.lastSaveUpdate =
+        updates
+
+    if Learning.Neural.dirtyWeights
+        or force then
+
+        if Learning.Neural.SafeEncodeFile(
+            LearningStorage.neuralWeightsPath,
+            Learning.Neural.model
+        ) then
+            Learning.Neural.dirtyWeights = false
+        end
+    end
+
+    if Learning.Neural.dirtyReplay
+        or force then
+
+        if Learning.Neural.SafeEncodeFile(
+            LearningStorage.neuralReplayPath,
+            Learning.Neural.replay
+        ) then
+            Learning.Neural.dirtyReplay = false
+        end
+    end
+
+    if Learning.Neural.dirtyStats
+        or force then
+
+        if Learning.Neural.SafeEncodeFile(
+            LearningStorage.neuralStatsPath,
+            Learning.Neural.stats
+        ) then
+            Learning.Neural.dirtyStats = false
+        end
+    end
+end
+
+Learning.Neural.SwapCase = function(char)
+    if string.match(
+        char,
+        "%u"
+    ) then
+        return string.lower(char)
+    end
+
+    if string.match(
+        char,
+        "%l"
+    ) then
+        return string.upper(char)
+    end
+
+    return char
+end
+
+Learning.Neural.PieceTypeValue = function(char)
+    local upper =
+        string.upper(
+            tostring(char or "")
+        )
+
+    if upper == "P" then
+        return 0.17, 1
+    elseif upper == "N" then
+        return 0.33, 3
+    elseif upper == "B" then
+        return 0.42, 3.2
+    elseif upper == "R" then
+        return 0.58, 5
+    elseif upper == "Q" then
+        return 0.83, 9
+    elseif upper == "K" then
+        return 1.00, 0
+    end
+
+    return 0, 0
+end
+
+Learning.Neural.ExtractFeatures = function(
+    position,
+    localTeam
+)
+    if not Config.NeuralEnabled
+        or type(position) ~= "table"
+        or type(position.board) ~= "string"
+        or type(localTeam) ~= "boolean" then
+
+        return nil
+    end
+
+    local squares = {}
+
+    for index = 1,
+        #position.board do
+
+        local char =
+            string.sub(
+                position.board,
+                index,
+                index
+            )
+
+        if char == "."
+            or string.match(
+                char,
+                "[prnbqkPRNBQK]"
+            ) then
+
+            squares[
+                #squares + 1
+            ] = char
+        end
+    end
+
+    if #squares ~= 64 then
+        return nil
+    end
+
+    local canonical = {}
+
+    if position.player
+        == localTeam then
+
+        for index = 1, 64 do
+            canonical[index] =
+                squares[index]
+        end
+    else
+        -- Sunfish rotates/swapcases the board every ply. Undo that so
+        -- the network always sees the board from OUR stable perspective.
+        for index = 1, 64 do
+            canonical[index] =
+                Learning.Neural.SwapCase(
+                    squares[
+                        65 - index
+                    ]
+                )
+        end
+    end
+
+    local features = {}
+
+    local ownMaterial = 0
+    local enemyMaterial = 0
+    local ownCount = 0
+    local enemyCount = 0
+
+    for squareIndex = 1, 64 do
+        local char =
+            canonical[squareIndex]
+
+        local featureIndex =
+            (squareIndex - 1)
+            * 2
+            + 1
+
+        if char == "." then
+            features[featureIndex] = 0
+            features[
+                featureIndex + 1
+            ] = 0
+        else
+            local isOwn =
+                string.match(
+                    char,
+                    "%u"
+                ) ~= nil
+
+            local typeValue,
+                material =
+                Learning.Neural.PieceTypeValue(
+                    char
+                )
+
+            features[featureIndex] =
+                isOwn
+                and 1
+                or -1
+
+            features[
+                featureIndex + 1
+            ] =
+                typeValue
+
+            if isOwn then
+                ownMaterial += material
+                ownCount += 1
+            else
+                enemyMaterial += material
+                enemyCount += 1
+            end
+        end
+    end
+
+    local localToMove =
+        position.player
+        == localTeam
+
+    local positionScore =
+        tonumber(
+            position.score
+        )
+        or 0
+
+    if not localToMove then
+        positionScore =
+            -positionScore
+    end
+
+    local ownCastling
+    local enemyCastling
+
+    if localToMove then
+        ownCastling =
+            position.wc
+
+        enemyCastling =
+            position.bc
+    else
+        ownCastling =
+            position.bc
+
+        enemyCastling =
+            position.wc
+    end
+
+    local repetitionVisit = 0
+
+    if Learning.session
+        and type(
+            Learning.session.sunfishVisits
+        ) == "table" then
+
+        local key =
+            LearningPositionKey(
+                position
+            )
+
+        repetitionVisit =
+            key
+            and (
+                tonumber(
+                    Learning.session.sunfishVisits[
+                        key
+                    ]
+                )
+                or 0
+            )
+            or 0
+    end
+
+    local extra = {
+        localToMove and 1 or -1,
+
+        Learning.Neural.Tanh(
+            positionScore / 600
+        ),
+
+        math.clamp(
+            (
+                tonumber(
+                    position.gamePhase
+                )
+                or 0
+            ) / 32,
+            0,
+            1
+        ),
+
+        math.clamp(
+            repetitionVisit / 3,
+            0,
+            1
+        ),
+
+        type(ownCastling) == "table"
+            and ownCastling[1] == true
+            and 1
+            or 0,
+
+        type(ownCastling) == "table"
+            and ownCastling[2] == true
+            and 1
+            or 0,
+
+        type(enemyCastling) == "table"
+            and enemyCastling[1] == true
+            and 1
+            or 0,
+
+        type(enemyCastling) == "table"
+            and enemyCastling[2] == true
+            and 1
+            or 0,
+
+        (
+            tonumber(position.ep)
+            and tonumber(position.ep) ~= 0
+            and tonumber(position.ep) ~= 119
+        )
+            and 1
+            or 0,
+
+        (
+            tonumber(position.kp)
+            and tonumber(position.kp) ~= 0
+            and tonumber(position.kp) ~= 119
+        )
+            and 1
+            or 0,
+
+        math.clamp(
+            ownMaterial / 39,
+            0,
+            1.5
+        ),
+
+        math.clamp(
+            enemyMaterial / 39,
+            0,
+            1.5
+        ),
+
+        math.clamp(
+            (ownMaterial - enemyMaterial)
+                / 39,
+            -1.5,
+            1.5
+        ),
+
+        math.clamp(
+            ownCount / 16,
+            0,
+            1
+        ),
+
+        math.clamp(
+            enemyCount / 16,
+            0,
+            1
+        ),
+
+        1,
+    }
+
+    for index = 1, 16 do
+        features[
+            128 + index
+        ] =
+            tonumber(extra[index])
+            or 0
+    end
+
+    if #features
+        ~= Config.NeuralInputSize then
+
+        return nil
+    end
+
+    return features
+end
+
+Learning.Neural.QuantizeFeatures = function(features)
+    if type(features) ~= "table"
+        or #features
+            ~= Config.NeuralInputSize then
+
+        return nil
+    end
+
+    local quantized = {}
+
+    for index = 1,
+        Config.NeuralInputSize do
+
+        local value =
+            math.clamp(
+                tonumber(
+                    features[index]
+                )
+                or 0,
+                -2,
+                2
+            )
+
+        local scaled =
+            value * 1000
+
+        quantized[index] =
+            scaled >= 0
+            and math.floor(
+                scaled + 0.5
+            )
+            or math.ceil(
+                scaled - 0.5
+            )
+    end
+
+    return quantized
+end
+
+Learning.Neural.DequantizeFeatures = function(quantized)
+    if type(quantized) ~= "table"
+        or #quantized
+            ~= Config.NeuralInputSize then
+
+        return nil
+    end
+
+    local features = {}
+
+    for index = 1,
+        Config.NeuralInputSize do
+
+        features[index] =
+            (
+                tonumber(
+                    quantized[index]
+                )
+                or 0
+            )
+            / 1000
+    end
+
+    return features
+end
+
+Learning.Neural.Forward = function(
+    features,
+    wantCache
+)
+    local model =
+        Learning.Neural.model
+
+    if not Learning.Neural.ValidateModel(
+        model
+    )
+        or type(features) ~= "table"
+        or #features
+            ~= Config.NeuralInputSize then
+
+        return 0,
+            nil
+    end
+
+    local activation = features
+
+    local cache =
+        wantCache
+        and {
+            activations = {
+                features,
+            },
+            pre = {},
+        }
+        or nil
+
+    for layerIndex, layer in ipairs(
+        model.layers
+    ) do
+        local output = {}
+
+        local isOutputLayer =
+            layerIndex
+            == #model.layers
+
+        local preLayer =
+            wantCache
+            and {}
+            or nil
+
+        for outIndex = 1,
+            layer.outputSize do
+
+            local sum =
+                tonumber(
+                    layer.bias[outIndex]
+                )
+                or 0
+
+            local weightBase =
+                (outIndex - 1)
+                * layer.inputSize
+
+            for inIndex = 1,
+                layer.inputSize do
+
+                sum +=
+                    (
+                        tonumber(
+                            layer.weights[
+                                weightBase
+                                + inIndex
+                            ]
+                        )
+                        or 0
+                    )
+                    * (
+                        tonumber(
+                            activation[
+                                inIndex
+                            ]
+                        )
+                        or 0
+                    )
+            end
+
+            if preLayer then
+                preLayer[
+                    outIndex
+                ] = sum
+            end
+
+            if isOutputLayer then
+                output[outIndex] =
+                    Learning.Neural.Tanh(
+                        sum
+                    )
+            else
+                output[outIndex] =
+                    math.max(
+                        0,
+                        sum
+                    )
+            end
+        end
+
+        if wantCache then
+            cache.pre[layerIndex] =
+                preLayer
+
+            cache.activations[
+                layerIndex + 1
+            ] =
+                output
+        end
+
+        activation = output
+    end
+
+    return tonumber(
+        activation[1]
+    ) or 0,
+        cache
+end
+
+Learning.Neural.PredictFeatures = function(features)
+    if not Config.NeuralEnabled
+        or not Learning.Neural.loaded then
+
+        return 0
+    end
+
+    local value =
+        Learning.Neural.Forward(
+            features,
+            false
+        )
+
+    return math.clamp(
+        tonumber(value) or 0,
+        -1,
+        1
+    )
+end
+
+Learning.Neural.PredictPosition = function(
+    position,
+    localTeam
+)
+    local features =
+        Learning.Neural.ExtractFeatures(
+            position,
+            localTeam
+        )
+
+    if not features then
+        return 0,
+            nil
+    end
+
+    return Learning.Neural.PredictFeatures(
+        features
+    ),
+        features
+end
+
+Learning.Neural.Confidence = function()
+    if not Config.NeuralEnabled
+        or not Learning.Neural.loaded then
+
+        return 0
+    end
+
+    local updates =
+        tonumber(
+            Learning.Neural.stats.updates
+        )
+        or 0
+
+    local replayCount =
+        #Learning.Neural.replay.samples
+
+    if updates
+        < Config.NeuralMinUpdates
+        or replayCount
+            < Config.NeuralMinReplayForTraining then
+
+        return 0
+    end
+
+    local updateProgress =
+        math.clamp(
+            (
+                updates
+                - Config.NeuralMinUpdates
+            )
+            / math.max(
+                Config.NeuralFullInfluenceUpdates
+                - Config.NeuralMinUpdates,
+                1
+            ),
+            0,
+            1
+        )
+
+    local replayProgress =
+        math.clamp(
+            replayCount / 300,
+            0,
+            1
+        )
+
+    return math.min(
+        updateProgress,
+        replayProgress
+    )
+end
+
+Learning.Neural.AddReplay = function(
+    features,
+    nextFeatures,
+    reward,
+    done,
+    target,
+    priority,
+    kind
+)
+    if not Config.NeuralEnabled
+        or type(features) ~= "table" then
+
+        return
+    end
+
+    local xq =
+        Learning.Neural.QuantizeFeatures(
+            features
+        )
+
+    if not xq then
+        return
+    end
+
+    local sample = {
+        x = xq,
+        reward =
+            tonumber(reward)
+            or 0,
+        done =
+            done == true,
+        priority =
+            math.clamp(
+                tonumber(priority)
+                    or 1,
+                0.05,
+                8
+            ),
+        kind =
+            tostring(
+                kind
+                or "td"
+            ),
+    }
+
+    if type(nextFeatures) == "table" then
+        sample.next =
+            Learning.Neural.QuantizeFeatures(
+                nextFeatures
+            )
+    end
+
+    if target ~= nil then
+        sample.target =
+            math.clamp(
+                tonumber(target)
+                    or 0,
+                -1,
+                1
+            )
+    end
+
+    local samples =
+        Learning.Neural.replay.samples
+
+    samples[
+        #samples + 1
+    ] = sample
+
+    Learning.Neural.replay.added =
+        (
+            tonumber(
+                Learning.Neural.replay.added
+            )
+            or 0
+        )
+        + 1
+
+    while #samples
+        > Config.NeuralReplayMax do
+
+        table.remove(
+            samples,
+            1
+        )
+    end
+
+    Learning.Neural.stats.samplesSeen =
+        (
+            tonumber(
+                Learning.Neural.stats.samplesSeen
+            )
+            or 0
+        )
+        + 1
+
+    Learning.Neural.dirtyReplay = true
+    Learning.Neural.dirtyStats = true
+end
+
+Learning.Neural.SampleReplay = function()
+    local samples =
+        Learning.Neural.replay.samples
+
+    if #samples == 0 then
+        return nil
+    end
+
+    local total = 0
+
+    for _, sample in ipairs(
+        samples
+    ) do
+        total +=
+            math.max(
+                tonumber(
+                    sample.priority
+                )
+                or 0.05,
+                0.05
+            )
+    end
+
+    if total <= 0 then
+        return samples[
+            math.random(
+                1,
+                #samples
+            )
+        ]
+    end
+
+    local needle =
+        math.random()
+        * total
+
+    local cursor = 0
+
+    for _, sample in ipairs(
+        samples
+    ) do
+        cursor +=
+            math.max(
+                tonumber(
+                    sample.priority
+                )
+                or 0.05,
+                0.05
+            )
+
+        if cursor >= needle then
+            return sample
+        end
+    end
+
+    return samples[#samples]
+end
+
+Learning.Neural.TrainSample = function(sample)
+    if type(sample) ~= "table" then
+        return nil
+    end
+
+    local features =
+        Learning.Neural.DequantizeFeatures(
+            sample.x
+        )
+
+    if not features then
+        return nil
+    end
+
+    local prediction, cache =
+        Learning.Neural.Forward(
+            features,
+            true
+        )
+
+    if not cache then
+        return nil
+    end
+
+    local target
+
+    if sample.target ~= nil then
+        target =
+            math.clamp(
+                tonumber(
+                    sample.target
+                )
+                or 0,
+                -1,
+                1
+            )
+    else
+        local bootstrap = 0
+
+        if sample.done ~= true
+            and type(sample.next)
+                == "table" then
+
+            local nextFeatures =
+                Learning.Neural.DequantizeFeatures(
+                    sample.next
+                )
+
+            if nextFeatures then
+                bootstrap =
+                    Learning.Neural.PredictFeatures(
+                        nextFeatures
+                    )
+            end
+        end
+
+        target =
+            math.clamp(
+                (
+                    tonumber(
+                        sample.reward
+                    )
+                    or 0
+                )
+                + Config.NeuralGamma
+                    * bootstrap,
+                -1,
+                1
+            )
+    end
+
+    local error =
+        prediction
+        - target
+
+    local absError =
+        math.abs(
+            error
+        )
+
+    local loss =
+        absError <= 1
+        and 0.5
+            * error
+            * error
+        or absError - 0.5
+
+    local lossGradient =
+        absError <= 1
+        and error
+        or (
+            error >= 0
+            and 1
+            or -1
+        )
+
+    local model =
+        Learning.Neural.model
+
+    local deltas = {}
+
+    local outputDelta =
+        lossGradient
+        * (
+            1
+            - prediction
+                * prediction
+        )
+
+    deltas[
+        #model.layers
+    ] = {
+        math.clamp(
+            outputDelta,
+            -Config.NeuralGradientClip,
+            Config.NeuralGradientClip
+        ),
+    }
+
+    -- Build hidden deltas from the old weights BEFORE applying updates.
+    for layerIndex =
+        #model.layers,
+        2,
+        -1 do
+
+        local layer =
+            model.layers[
+                layerIndex
+            ]
+
+        local previousLayer =
+            model.layers[
+                layerIndex - 1
+            ]
+
+        local currentDelta =
+            deltas[
+                layerIndex
+            ]
+
+        local previousActivation =
+            cache.activations[
+                layerIndex
+            ]
+
+        local previousDelta = {}
+
+        for inIndex = 1,
+            layer.inputSize do
+
+            local sum = 0
+
+            for outIndex = 1,
+                layer.outputSize do
+
+                local weightIndex =
+                    (outIndex - 1)
+                    * layer.inputSize
+                    + inIndex
+
+                sum +=
+                    (
+                        tonumber(
+                            layer.weights[
+                                weightIndex
+                            ]
+                        )
+                        or 0
+                    )
+                    * (
+                        tonumber(
+                            currentDelta[
+                                outIndex
+                            ]
+                        )
+                        or 0
+                    )
+            end
+
+            local reluDerivative =
+                (
+                    tonumber(
+                        previousActivation[
+                            inIndex
+                        ]
+                    )
+                    or 0
+                ) > 0
+                and 1
+                or 0
+
+            previousDelta[
+                inIndex
+            ] =
+                math.clamp(
+                    sum
+                        * reluDerivative,
+                    -Config.NeuralGradientClip,
+                    Config.NeuralGradientClip
+                )
+        end
+
+        -- previousLayer exists to document/validate shape.
+        if previousLayer then
+            deltas[
+                layerIndex - 1
+            ] =
+                previousDelta
+        end
+    end
+
+    local learningRate =
+        Config.NeuralLearningRate
+
+    local weightDecay =
+        Config.NeuralWeightDecay
+
+    -- SGD update.
+    for layerIndex, layer in ipairs(
+        model.layers
+    ) do
+        local inputActivation =
+            cache.activations[
+                layerIndex
+            ]
+
+        local delta =
+            deltas[
+                layerIndex
+            ]
+
+        for outIndex = 1,
+            layer.outputSize do
+
+            local d =
+                math.clamp(
+                    tonumber(
+                        delta[
+                            outIndex
+                        ]
+                    )
+                    or 0,
+                    -Config.NeuralGradientClip,
+                    Config.NeuralGradientClip
+                )
+
+            local weightBase =
+                (outIndex - 1)
+                * layer.inputSize
+
+            for inIndex = 1,
+                layer.inputSize do
+
+                local weightIndex =
+                    weightBase
+                    + inIndex
+
+                local oldWeight =
+                    tonumber(
+                        layer.weights[
+                            weightIndex
+                        ]
+                    )
+                    or 0
+
+                local gradient =
+                    d
+                    * (
+                        tonumber(
+                            inputActivation[
+                                inIndex
+                            ]
+                        )
+                        or 0
+                    )
+
+                gradient =
+                    math.clamp(
+                        gradient,
+                        -Config.NeuralGradientClip,
+                        Config.NeuralGradientClip
+                    )
+
+                layer.weights[
+                    weightIndex
+                ] =
+                    math.clamp(
+                        oldWeight
+                        - learningRate
+                            * gradient
+                        - learningRate
+                            * weightDecay
+                            * oldWeight,
+                        -5,
+                        5
+                    )
+            end
+
+            layer.bias[outIndex] =
+                math.clamp(
+                    (
+                        tonumber(
+                            layer.bias[
+                                outIndex
+                            ]
+                        )
+                        or 0
+                    )
+                    - learningRate
+                        * d,
+                    -5,
+                    5
+                )
+        end
+    end
+
+    sample.priority =
+        math.clamp(
+            absError
+                + 0.08,
+            0.05,
+            8
+        )
+
+    Learning.Neural.dirtyWeights = true
+    Learning.Neural.dirtyReplay = true
+
+    return loss,
+        error,
+        target,
+        prediction
+end
+
+Learning.Neural.TrainBatch = function()
+    if not Config.NeuralEnabled
+        or Learning.Neural.training then
+
+        return nil
+    end
+
+    if #Learning.Neural.replay.samples
+        < Config.NeuralMinReplayForTraining then
+
+        return nil
+    end
+
+    Learning.Neural.training = true
+
+    local startedAt =
+        os.clock()
+
+    local totalLoss = 0
+    local trained = 0
+
+    for _ = 1,
+        Config.NeuralBatchSize do
+
+        local sample =
+            Learning.Neural.SampleReplay()
+
+        if sample then
+            local loss =
+                Learning.Neural.TrainSample(
+                    sample
+                )
+
+            if loss then
+                totalLoss += loss
+                trained += 1
+            end
+        end
+    end
+
+    Learning.Neural.training = false
+
+    if trained <= 0 then
+        return nil
+    end
+
+    local avgLoss =
+        totalLoss
+        / trained
+
+    local stats =
+        Learning.Neural.stats
+
+    stats.updates =
+        (
+            tonumber(stats.updates)
+            or 0
+        )
+        + 1
+
+    stats.lastLoss =
+        avgLoss
+
+    stats.avgLoss =
+        (
+            tonumber(stats.avgLoss)
+            or 0
+        ) == 0
+        and avgLoss
+        or (
+            tonumber(stats.avgLoss)
+            * 0.94
+            + avgLoss
+                * 0.06
+        )
+
+    stats.lastTrainSeconds =
+        os.clock()
+        - startedAt
+
+    Learning.Neural.dirtyStats = true
+
+    Learning.Neural.Save(false)
+
+    return avgLoss
+end
+
+Learning.Neural.TrainBatches = function(
+    batchCount,
+    reason
+)
+    if not Config.NeuralEnabled
+        or Learning.Neural.training
+        or Learning.Neural.jobRunning then
+
+        return
+    end
+
+    batchCount =
+        math.max(
+            math.floor(
+                tonumber(batchCount)
+                or 0
+            ),
+            0
+        )
+
+    if batchCount <= 0 then
+        return
+    end
+
+    Learning.Neural.jobRunning =
+        true
+
+    task.spawn(
+        function()
+            local losses = {}
+            local startedAt =
+                os.clock()
+
+            for _ = 1, batchCount do
+                -- Do not let background training compete with a new live game.
+                local live =
+                    GetCurrentMatch()
+
+                if live then
+                    break
+                end
+
+                local okTrain,
+                    lossOrError =
+                    pcall(
+                        Learning.Neural.TrainBatch
+                    )
+
+                if not okTrain then
+                    Learning.Neural.training =
+                        false
+
+                    LearningLog(
+                        "NEURAL_TRAIN_ERROR "
+                        .. tostring(
+                            lossOrError
+                        )
+                    )
+
+                    break
+                end
+
+                if lossOrError then
+                    losses[
+                        #losses + 1
+                    ] =
+                        lossOrError
+                end
+
+                task.wait()
+            end
+
+            Learning.Neural.training =
+                false
+
+            Learning.Neural.jobRunning =
+                false
+
+            if #losses > 0 then
+                local sum = 0
+
+                for _, loss in ipairs(
+                    losses
+                ) do
+                    sum += loss
+                end
+
+                LearningLog(
+                    string.format(
+                        "NEURAL_TRAIN reason=%s batches=%d loss=%.5f replay=%d updates=%d time=%.2fs confidence=%.1f%%",
+                        tostring(
+                            reason or "?"
+                        ),
+                        #losses,
+                        sum / #losses,
+                        #Learning.Neural.replay.samples,
+                        tonumber(
+                            Learning.Neural.stats.updates
+                        ) or 0,
+                        os.clock() - startedAt,
+                        Learning.Neural.Confidence()
+                            * 100
+                    )
+                )
+
+                Learning.Neural.Save(true)
+            end
+        end
+    )
+end
+
+Learning.Neural.IdleTick = function(match)
+    if not Config.NeuralEnabled
+        or match ~= nil
+        or Learning.Neural.training
+        or Learning.Neural.jobRunning then
+
+        return
+    end
+
+    local now =
+        os.clock()
+
+    if now
+        - Learning.Neural.lastIdleTrain
+        < Config.NeuralIdleInterval then
+
+        return
+    end
+
+    Learning.Neural.lastIdleTrain =
+        now
+
+    if #Learning.Neural.replay.samples
+        >= Config.NeuralMinReplayForTraining then
+
+        Learning.Neural.TrainBatches(
+            Config.NeuralIdleBatches,
+            "lobby"
+        )
+    end
+end
+
+Learning.Neural.MoveBias = function(
+    position,
+    move,
+    localTeam
+)
+    local confidence =
+        Learning.Neural.Confidence()
+
+    if confidence <= 0
+        or type(position) ~= "table"
+        or type(move) ~= "table"
+        or type(localTeam) ~= "boolean" then
+
+        return 0,
+            0,
+            confidence
+    end
+
+    local okNext, nextPosition =
+        pcall(function()
+            return position:move(
+                move
+            )
+        end)
+
+    if not okNext
+        or type(nextPosition) ~= "table" then
+
+        return 0,
+            0,
+            confidence
+    end
+
+    local value =
+        Learning.Neural.PredictPosition(
+            nextPosition,
+            localTeam
+        )
+
+    local bias =
+        value
+        * Config.NeuralInfluenceCp
+        * confidence
+
+    return bias,
+        value,
+        confidence
+end
+
+Learning.Neural.RerankAutomatic = function(
+    match,
+    position,
+    localTeam,
+    selectedMove,
+    info
+)
+    local confidence =
+        Learning.Neural.Confidence()
+
+    if confidence <= 0
+        or type(info) ~= "table"
+        or type(info.candidates)
+            ~= "table"
+        or type(selectedMove)
+            ~= "table" then
+
+        return selectedMove,
+            info
+    end
+
+    local pool = {}
+    local seen = {}
+
+    local function add(
+        move,
+        score,
+        source
+    )
+        if type(move) ~= "table" then
+            return
+        end
+
+        local key =
+            MoveIdentity(move)
+
+        if seen[key] then
+            return
+        end
+
+        if not ResolveGameMove(
+            match,
+            move,
+            position,
+            localTeam
+        ) then
+            return
+        end
+
+        seen[key] = true
+
+        local neuralBias,
+            neuralValue =
+            Learning.Neural.MoveBias(
+                position,
+                move,
+                localTeam
+            )
+
+        local memoryBias =
+            LearningOwnMoveBias(
+                position,
+                move
+            )
+
+        pool[
+            #pool + 1
+        ] = {
+            move = move,
+            base =
+                tonumber(score)
+                or 0,
+            neuralBias =
+                neuralBias,
+            neuralValue =
+                neuralValue,
+            memoryBias =
+                memoryBias,
+            source =
+                source,
+        }
+    end
+
+    add(
+        selectedMove,
+        info.score,
+        "selected"
+    )
+
+    for index, candidate in ipairs(
+        info.candidates
+    ) do
+        add(
+            candidate.move,
+            candidate.score,
+            "candidate"
+        )
+
+        if index
+            >= Config.NeuralAutomaticCandidates then
+
+            break
+        end
+    end
+
+    if #pool <= 1 then
+        return selectedMove,
+            info
+    end
+
+    for _, entry in ipairs(pool) do
+        entry.total =
+            entry.base
+            + entry.neuralBias
+            + entry.memoryBias
+    end
+
+    table.sort(
+        pool,
+        function(a, b)
+            return a.total
+                > b.total
+        end
+    )
+
+    local winner =
+        pool[1]
+
+    local current
+
+    for _, entry in ipairs(pool) do
+        if MoveIdentity(entry.move)
+            == MoveIdentity(
+                selectedMove
+            ) then
+
+            current = entry
+            break
+        end
+    end
+
+    current =
+        current
+        or winner
+
+    info.neural = {
+        confidence =
+            confidence,
+        value =
+            winner.neuralValue,
+        bias =
+            winner.neuralBias,
+        memoryBias =
+            winner.memoryBias,
+        changed =
+            MoveIdentity(
+                winner.move
+            ) ~= MoveIdentity(
+                selectedMove
+            ),
+    }
+
+    -- Require a small margin so low-confidence noise does not flip
+    -- effectively-equal candidates every move.
+    if winner.total
+        > current.total + 12
+        and info.neural.changed then
+
+        SetThinkingNarrative(
+            string.format(
+                "Neural rerank: %.0f%% confidence • value %+.2f • bias %+d.",
+                confidence * 100,
+                winner.neuralValue,
+                math.floor(
+                    winner.neuralBias
+                )
+            ),
+            "thinking"
+        )
+
+        return winner.move,
+            info
+    end
+
+    return selectedMove,
+        info
+end
+
+Learning.Neural.RecordOwnTurnState = function(
+    session,
+    features
+)
+    if type(session) ~= "table"
+        or type(features) ~= "table" then
+
+        return
+    end
+
+    if session.neuralPendingState then
+        Learning.Neural.AddReplay(
+            session.neuralPendingState,
+            features,
+            0,
+            false,
+            nil,
+            0.35,
+            "td-fullply"
+        )
+    end
+
+    session.neuralPendingState =
+        features
+
+    session.neuralTrajectory[
+        #session.neuralTrajectory + 1
+    ] =
+        features
+end
+
+Learning.Neural.FinalizeGame = function(
+    session,
+    result,
+    reason
+)
+    if not Config.NeuralEnabled
+        or type(session) ~= "table" then
+
+        return
+    end
+
+    local outcome =
+        result == "win"
+        and 1
+        or result == "loss"
+        and -1
+        or result == "draw"
+        and 0
+        or nil
+
+    if outcome == nil then
+        return
+    end
+
+    local stats =
+        Learning.Neural.stats
+
+    stats.games =
+        (
+            tonumber(stats.games)
+            or 0
+        )
+        + 1
+
+    if result == "win" then
+        stats.wins =
+            (tonumber(stats.wins) or 0)
+            + 1
+    elseif result == "loss" then
+        stats.losses =
+            (tonumber(stats.losses) or 0)
+            + 1
+    elseif result == "draw" then
+        stats.draws =
+            (tonumber(stats.draws) or 0)
+            + 1
+    else
+        stats.unknown =
+            (tonumber(stats.unknown) or 0)
+            + 1
+    end
+
+    Learning.Neural.dirtyStats = true
+
+    -- Terminal TD sample for the last state where it was our turn.
+    if session.neuralPendingState then
+        Learning.Neural.AddReplay(
+            session.neuralPendingState,
+            nil,
+            outcome,
+            true,
+            outcome,
+            2.2,
+            "terminal"
+        )
+    end
+
+    local trajectory =
+        session.neuralTrajectory
+
+    local count =
+        #trajectory
+
+    local isRepetition =
+        result == "draw"
+        and (
+            session.repetitionDraw
+            or string.find(
+                string.lower(
+                    tostring(
+                        reason or ""
+                    )
+                ),
+                "repetition",
+                1,
+                true
+            ) ~= nil
+        )
+
+    for index, features in ipairs(
+        trajectory
+    ) do
+        local distance =
+            count - index
+
+        local target =
+            outcome
+            * (
+                Config.NeuralGamma
+                ^ distance
+            )
+
+        local priority =
+            0.70
+            + 0.90
+                * math.exp(
+                    -distance / 6
+                )
+
+        if isRepetition
+            and distance <= 6 then
+
+            priority += 1.3
+        end
+
+        Learning.Neural.AddReplay(
+            features,
+            nil,
+            0,
+            true,
+            target,
+            priority,
+            isRepetition
+                and "mc-repetition"
+                or "mc-outcome"
+        )
+    end
+
+    LearningLog(
+        string.format(
+            "NEURAL_GAME result=%s reason=%s trajectory=%d replay=%d",
+            tostring(result),
+            tostring(reason or "?"),
+            count,
+            #Learning.Neural.replay.samples
+        )
+    )
+
+    Learning.Neural.Save(true)
+
+    task.delay(
+        0.65,
+        function()
+            Learning.Neural.TrainBatches(
+                Config.NeuralEndGameBatches,
+                "post-game "
+                    .. tostring(result)
+            )
+        end
+    )
+end
+
 LearningLoad()
+Learning.Neural.Load()
 
 -- Supplement result detection with the game's EndGame event. We do not
 -- assume an undocumented argument schema; only explicit result strings
@@ -3392,6 +5648,29 @@ Learning.ProcessHistory = function(match)
         if sunfishKey then
             session.sunfishVisits[sunfishKey] = 1
         end
+
+        if Config.NeuralEnabled
+            and type(session.localTeam)
+                == "boolean"
+            and position.player
+                == session.localTeam then
+
+            local features =
+                Learning.Neural.ExtractFeatures(
+                    position,
+                    session.localTeam
+                )
+
+            if features then
+                session.neuralPendingState =
+                    features
+
+                session.neuralTrajectory[
+                    #session.neuralTrajectory + 1
+                ] =
+                    features
+            end
+        end
     end
 
     if #history < session.historyIndex then
@@ -3481,6 +5760,26 @@ Learning.ProcessHistory = function(match)
         position = nextPosition
         session.historyPosition = position
         session.historyIndex = index
+
+        if Config.NeuralEnabled
+            and type(session.localTeam)
+                == "boolean"
+            and position.player
+                == session.localTeam then
+
+            local features =
+                Learning.Neural.ExtractFeatures(
+                    position,
+                    session.localTeam
+                )
+
+            if features then
+                Learning.Neural.RecordOwnTurnState(
+                    session,
+                    features
+                )
+            end
+        end
 
         local repetitionKey =
             Learning.CanonicalRepetitionFEN(
@@ -5646,6 +7945,22 @@ local function AutomaticSearch(
         end
     end
 
+    if Config.NeuralEnabled
+        and type(
+            Learning.Neural.RerankAutomatic
+        ) == "function" then
+
+        chosenMove,
+            chosenInfo =
+            Learning.Neural.RerankAutomatic(
+                match,
+                position,
+                localTeam,
+                chosenMove,
+                chosenInfo
+            )
+    end
+
     local shouldAudit =
         critical
         or complexity >= 4
@@ -5711,6 +8026,16 @@ local function AutomaticSearch(
             safety
             and safety.audit
             and safety.audit.mateDanger
+            or false,
+
+        neuralConfidence =
+            chosenInfo.neural
+            and chosenInfo.neural.confidence
+            or 0,
+
+        neuralChanged =
+            chosenInfo.neural
+            and chosenInfo.neural.changed
             or false,
     }
 
@@ -6254,6 +8579,25 @@ local function AddCompetitiveCandidate(
         )
         or 0
 
+    local neuralBias = 0
+    local neuralValue = 0
+    local neuralConfidence = 0
+
+    if Config.NeuralEnabled
+        and type(
+            Learning.Neural.MoveBias
+        ) == "function" then
+
+        neuralBias,
+            neuralValue,
+            neuralConfidence =
+            Learning.Neural.MoveBias(
+                position,
+                move,
+                team
+            )
+    end
+
     local repetitionPenalty = 0
 
     if repetitionRisk >= 2
@@ -6275,10 +8619,20 @@ local function AddCompetitiveCandidate(
                 or -90000
             )
             + memoryBias
+            + neuralBias
             - repetitionPenalty,
 
         repetitionRisk =
             repetitionRisk,
+
+        neuralBias =
+            neuralBias,
+
+        neuralValue =
+            neuralValue,
+
+        neuralConfidence =
+            neuralConfidence,
 
         rawScore =
             tonumber(ownScore)
@@ -6794,6 +9148,18 @@ local function CompetitiveSearch(
 
         memoryBias =
             winner.entry.memoryBias
+            or 0,
+
+        neuralBias =
+            winner.entry.neuralBias
+            or 0,
+
+        neuralValue =
+            winner.entry.neuralValue
+            or 0,
+
+        neuralConfidence =
+            winner.entry.neuralConfidence
             or 0,
 
         source =
@@ -10025,6 +12391,18 @@ task.spawn(function()
         local match =
             GetCurrentMatch()
 
+        if type(
+            Learning.Neural
+        ) == "table"
+            and type(
+                Learning.Neural.IdleTick
+            ) == "function" then
+
+            Learning.Neural.IdleTick(
+                match
+            )
+        end
+
         if not match then
             SetHUDSleeping(true)
 
@@ -10145,7 +12523,7 @@ SetHUDSleeping(true)
 SetStatus("READY", false)
 
 print(
-    "[ChessAI] v5.1 loaded • Draw/Teacher/Repetition learning",
+    "[ChessAI] v6.0 loaded • Native Neural Value Network",
     "| Mode:",
     Config.Mode,
     "| Memory:",
@@ -10154,6 +12532,16 @@ print(
         or "RAM",
     "| Save:",
     LearningStorage.memoryPath,
+    "| NN:",
+    string.format(
+        "%d samples / %d updates / %.0f%%",
+        #Learning.Neural.replay.samples,
+        tonumber(
+            Learning.Neural.stats.updates
+        ) or 0,
+        Learning.Neural.Confidence()
+            * 100
+    ),
     "| Remote:",
     MovePieceRemote:GetFullName()
 )
